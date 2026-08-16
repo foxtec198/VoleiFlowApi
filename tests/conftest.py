@@ -3,7 +3,7 @@ import secrets
 import pytest
 
 from app import create_app
-from models import Admin, Position
+from models import Admin, Place, Position
 from utils.db import db
 from utils.password_security import hash_password
 from utils.token import create_admin_token
@@ -23,6 +23,7 @@ def app():
     })
     with application.app_context():
         db.create_all()
+        db.session.add(Place(name="Nilo", slug="nilo", active=True))
         db.session.add_all([
             Position(name="Ponteiro", required_per_team=1),
             Position(name="Central", required_per_team=0),

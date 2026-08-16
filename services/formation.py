@@ -2,6 +2,7 @@ from collections import defaultdict
 
 from models import Event, Position, Registration, Team, TeamMember
 from services.events import registration_dict
+from services.places import current_place
 from utils.db import db
 from utils.errors import ApiError
 
@@ -40,6 +41,9 @@ def team_dict(team, include_private=False):
 
 
 def formation_payload(event_id, shift_id):
+    event = db.session.get(Event, event_id)
+    if not event or event.place_id != current_place().id:
+        raise ApiError("Evento ou turno inválido.", 404)
     teams = Team.query.filter_by(event_id=event_id, shift_id=shift_id).order_by(Team.number).all()
     metrics = [team_metrics(team) for team in teams]
     differences = {}
@@ -66,7 +70,7 @@ class FormationService:
     @staticmethod
     def generate(event_id, shift_id):
         event = db.session.get(Event, event_id)
-        if not event or shift_id not in {shift.id for shift in event.shifts}:
+        if not event or event.place_id != current_place().id or shift_id not in {shift.id for shift in event.shifts}:
             raise ApiError("Evento ou turno inválido.", 404)
         candidates = Registration.query.filter(
             Registration.event_id == event_id,
@@ -75,6 +79,7 @@ class FormationService:
         ).all()
         candidates.sort(key=lambda item: (
             0 if item.status in {"confirmed", "present"} else 1,
+            item.priority_level,
             -item.overall,
             item.created_at,
             item.id,
@@ -104,6 +109,7 @@ class FormationService:
                     candidate = min(qualified, key=lambda item: (
                         0 if item.primary_position_id == position.id else 1,
                         0 if item.status in {"confirmed", "present"} else 1,
+                        item.priority_level,
                         abs((totals[team.id] + item.overall) - min(totals.values() or [0])),
                         -item.overall,
                         item.id,

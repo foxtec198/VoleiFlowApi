@@ -3,10 +3,14 @@ from email.message import EmailMessage
 
 from flask import current_app
 
+from models import Place
+from utils.db import db
+
 
 def send_confirmation(player, event, token):
     base_url = current_app.config["APP_URL"].rstrip("/")
-    link = f"{base_url}/confirmar/{token}"
+    place = db.session.get(Place, event.place_id)
+    link = f"{base_url}/{place.slug}/confirmar/{token}"
     host = current_app.config.get("SMTP_HOST")
     if not host:
         current_app.logger.warning("SMTP não configurado; confirmação disponível em %s", link)

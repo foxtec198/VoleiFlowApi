@@ -27,6 +27,7 @@ def create_app(test_config=None):
         SMTP_PASSWORD=os.getenv("SMTP_PASSWORD", ""),
         SMTP_FROM=os.getenv("SMTP_FROM", os.getenv("SMTP_USER", "")),
         APP_URL=os.getenv("APP_URL", "http://localhost:5173"),
+        DEFAULT_PLACE_SLUG=os.getenv("DEFAULT_PLACE_SLUG", "nilo"),
         TESTING=False,
     )
     if test_config:
@@ -79,9 +80,14 @@ def create_app(test_config=None):
     @app.cli.command("init-db")
     @with_appcontext
     def init_db():
-        from models import Position, Setting
+        from models import Place, PlaceSetting, Position, Setting
 
         db.create_all()
+        place = Place.query.filter_by(slug=app.config["DEFAULT_PLACE_SLUG"]).first()
+        if not place:
+            place = Place(name="Nilo", slug=app.config["DEFAULT_PLACE_SLUG"], active=True)
+            db.session.add(place)
+            db.session.flush()
         defaults = [
             ("Ponteiro", 2), ("Central", 2), ("Líbero", 1),
             ("Levantador", 1), ("Oposto", 1),
@@ -98,6 +104,8 @@ def create_app(test_config=None):
         for key, value in settings.items():
             if not db.session.get(Setting, key):
                 db.session.add(Setting(key=key, value=value))
+            if not PlaceSetting.query.filter_by(place_id=place.id, key=key).first():
+                db.session.add(PlaceSetting(place_id=place.id, key=key, value=value))
         db.session.commit()
         click.echo("Banco inicializado sem remover ou sobrescrever registros existentes.")
 

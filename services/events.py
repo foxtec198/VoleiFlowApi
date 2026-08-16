@@ -5,10 +5,11 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
-from models import BlacklistEntry, Event, Player, Position, Registration, Shift
+from models import BlacklistEntry, Event, PlacePlayer, Player, Position, Registration, Shift
 from services.catalog import get_settings
-from services.common import paginate, parse_date, parse_datetime, parse_time, utcnow
+from services.common import as_bool, paginate, parse_date, parse_datetime, parse_time, utcnow
 from services.mailer import send_confirmation
+from services.places import current_place
 from utils.db import db
 from utils.errors import ApiError, require_fields
 
@@ -38,6 +39,7 @@ def registration_dict(registration, admin=False):
         "assigned_position": registration.assigned_position.name if registration.assigned_position else None,
         "shift": registration.shift.name,
         "overall": registration.overall,
+        "membership": "guest" if registration.is_guest else "member",
     })
     data.pop("email_confirmation_token", None)
     if not admin:
@@ -73,7 +75,7 @@ class EventService:
     @staticmethod
     def list():
         from flask import request
-        query = Event.query
+        query = Event.query.filter_by(place_id=current_place().id)
         if request.args.get("status"):
             query = query.filter_by(status=request.args["status"])
         else:
@@ -86,9 +88,12 @@ class EventService:
     def remove(event, scope="single"):
         if scope not in {"single", "recurrence"}:
             raise ApiError("Escopo de remoção inválido.", 422)
-        query = Event.query.filter_by(id=event.id)
+        place = current_place()
+        if event.place_id != place.id:
+            raise ApiError("Evento não encontrado neste local.", 404)
+        query = Event.query.filter_by(id=event.id, place_id=place.id)
         if scope == "recurrence" and event.recurrence_group:
-            query = Event.query.filter_by(recurrence_group=event.recurrence_group)
+            query = Event.query.filter_by(recurrence_group=event.recurrence_group, place_id=place.id)
         affected = query.filter(Event.status != "deleted").update(
             {Event.status: "deleted", Event.updated_at: utcnow()}, synchronize_session=False
         )
@@ -109,7 +114,12 @@ class EventService:
         team_count = int(data.get("team_count", settings["max_teams_per_event"]))
         if not 1 <= team_count <= int(settings["max_teams_per_event"]):
             raise ApiError(f"A quantidade de times deve estar entre 1 e {settings['max_teams_per_event']}.", 422)
-        shifts = Shift.query.filter(Shift.id.in_(data["shift_ids"]), Shift.active.is_(True)).all()
+        place = current_place()
+        if event and event.place_id != place.id:
+            raise ApiError("Evento não encontrado neste local.", 404)
+        shifts = Shift.query.filter(
+            Shift.id.in_(data["shift_ids"]), Shift.active.is_(True), Shift.place_id == place.id
+        ).all()
         if len(shifts) != len(set(data["shift_ids"])):
             raise ApiError("Um ou mais turnos são inválidos ou inativos.", 422)
         deadline = data.get("confirmation_deadline")
@@ -119,7 +129,7 @@ class EventService:
             deadline = datetime.combine(game_date, starts_at, tzinfo=timezone.utc) - timedelta(
                 days=int(settings["confirmation_deadline_days"])
             )
-        event = event or Event()
+        event = event or Event(place_id=place.id)
         event.title = str(data["title"]).strip()
         event.game_date = game_date
         event.starts_at = starts_at
@@ -162,8 +172,11 @@ class EventService:
         return [event_dict(item) for item in created]
 
 
-def active_blacklist(player_id):
-    return BlacklistEntry.query.filter_by(player_id=player_id, removed_at=None).order_by(BlacklistEntry.included_at.desc()).first()
+def active_blacklist(player_id, place_id=None):
+    place_id = place_id or current_place().id
+    return BlacklistEntry.query.filter_by(
+        place_id=place_id, player_id=player_id, removed_at=None
+    ).order_by(BlacklistEntry.included_at.desc()).first()
 
 
 def position_has_capacity(event, shift_id, position_id, exclude_registration_id=None):
@@ -183,6 +196,28 @@ def position_has_capacity(event, shift_id, position_id, exclude_registration_id=
 
 class RegistrationService:
     @staticmethod
+    def _rebalance_pending(event, shift_id, position_id):
+        position = db.session.get(Position, position_id)
+        capacity = position.required_per_team * event.team_count
+        occupied = Registration.query.filter(
+            Registration.event_id == event.id,
+            Registration.shift_id == shift_id,
+            Registration.primary_position_id == position_id,
+            Registration.status.in_(["confirmed", "present"]),
+        ).count()
+        contenders = Registration.query.filter(
+            Registration.event_id == event.id,
+            Registration.shift_id == shift_id,
+            Registration.primary_position_id == position_id,
+            Registration.status.in_(["pending_confirmation", "waitlist"]),
+        ).order_by(Registration.priority_level, Registration.created_at, Registration.id).all()
+        eligible = [item for item in contenders if not active_blacklist(item.player_id, event.place_id)]
+        available = max(capacity - occupied, 0)
+        selected = {item.id for item in eligible[:available]}
+        for item in contenders:
+            item.status = "pending_confirmation" if item.id in selected else "waitlist"
+
+    @staticmethod
     def create(data):
         require_fields(data, "event_id", "player_id", "shift_id", "primary_position_id")
         event = db.session.get(Event, data["event_id"])
@@ -190,24 +225,28 @@ class RegistrationService:
         shift = db.session.get(Shift, data["shift_id"])
         primary = db.session.get(Position, data["primary_position_id"])
         secondary = db.session.get(Position, data.get("secondary_position_id")) if data.get("secondary_position_id") else None
-        if not event or event.status != "scheduled":
+        place = current_place()
+        membership = PlacePlayer.query.filter_by(place_id=place.id, player_id=data["player_id"]).first()
+        if not event or event.place_id != place.id or event.status != "scheduled":
             raise ApiError("Evento indisponível para inscrição.", 422)
         opens_at = event.registration_opens_at
         if opens_at.tzinfo is None:
             opens_at = opens_at.replace(tzinfo=timezone.utc)
         if utcnow() < opens_at:
             raise ApiError("As inscrições ainda não foram liberadas.", 422)
-        if not player or not player.active:
+        if not player or not membership or not membership.active:
             raise ApiError("Jogador inválido ou inativo.", 422)
         if not shift or shift not in event.shifts:
             raise ApiError("Turno não disponível neste evento.", 422)
         if not primary or not primary.active or (secondary and not secondary.active):
             raise ApiError("Posição inválida ou inativa.", 422)
-        blocked = active_blacklist(player.id)
-        has_capacity = position_has_capacity(event, shift.id, primary.id)
+        blocked = active_blacklist(player.id, place.id)
+        is_guest = as_bool(data.get("is_guest", membership.is_guest))
         registration = Registration(
             event=event, player=player, shift=shift, primary_position=primary, secondary_position=secondary,
-            status="waitlist" if blocked or not has_capacity else "pending_confirmation",
+            status="waitlist" if blocked else "pending_confirmation",
+            is_guest=is_guest,
+            priority_level=membership.priority_for(is_guest),
             notes=str(data.get("notes", "")).strip() or None,
             email_confirmation_token=secrets.token_urlsafe(32),
             snapshot_name=player.name,
@@ -221,6 +260,8 @@ class RegistrationService:
         )
         try:
             db.session.add(registration)
+            db.session.flush()
+            RegistrationService._rebalance_pending(event, shift.id, primary.id)
             db.session.commit()
         except IntegrityError:
             db.session.rollback()
@@ -238,13 +279,13 @@ class RegistrationService:
     @staticmethod
     def confirm(token):
         registration = Registration.query.filter_by(email_confirmation_token=token).first()
-        if not registration:
+        if not registration or registration.event.place_id != current_place().id:
             raise ApiError("Link de confirmação inválido.", 404)
         if registration.status == "cancelled":
             raise ApiError("Esta inscrição foi cancelada.", 409)
         registration.email_confirmed_at = registration.email_confirmed_at or utcnow()
         registration.confirmed_at = utcnow()
-        if active_blacklist(registration.player_id):
+        if active_blacklist(registration.player_id, registration.event.place_id):
             registration.status = "waitlist"
         else:
             position = registration.primary_position
@@ -258,15 +299,9 @@ class RegistrationService:
             capacity = position.required_per_team * registration.event.team_count
             if confirmed_count < capacity:
                 registration.status = "confirmed"
-                pending = Registration.query.filter(
-                    Registration.event_id == registration.event_id,
-                    Registration.shift_id == registration.shift_id,
-                    Registration.primary_position_id == registration.primary_position_id,
-                    Registration.status == "pending_confirmation",
-                ).order_by(Registration.created_at.desc(), Registration.id.desc()).all()
-                overflow = confirmed_count + 1 + len(pending) - capacity
-                for item in pending[:max(overflow, 0)]:
-                    item.status = "waitlist"
+                RegistrationService._rebalance_pending(
+                    registration.event, registration.shift_id, registration.primary_position_id
+                )
             else:
                 registration.status = "waitlist"
         db.session.commit()
@@ -276,12 +311,27 @@ class RegistrationService:
     def update_status(registration, status, reason=None):
         if status not in REGISTRATION_STATUSES:
             raise ApiError("Status de inscrição inválido.", 422)
+        previous_status = registration.status
+        attendance_statuses = {"present"}
+        absence_statuses = {"justified_absence", "unjustified_absence"}
+        membership = PlacePlayer.query.filter_by(
+            place_id=registration.event.place_id, player_id=registration.player_id
+        ).one()
+        if previous_status in attendance_statuses:
+            membership.attendance_count = max((membership.attendance_count or 0) - 1, 0)
+        if previous_status in absence_statuses:
+            membership.absence_count = max((membership.absence_count or 0) - 1, 0)
         registration.status = status
+        if status in attendance_statuses:
+            membership.attendance_count = (membership.attendance_count or 0) + 1
+        if status in absence_statuses:
+            membership.absence_count = (membership.absence_count or 0) + 1
         registration.absence_reason = str(reason).strip() if reason else None
         if status == "confirmed":
             registration.confirmed_at = utcnow()
-        if status == "unjustified_absence" and not active_blacklist(registration.player_id):
+        if status == "unjustified_absence" and not active_blacklist(registration.player_id, registration.event.place_id):
             db.session.add(BlacklistEntry(
+                place_id=registration.event.place_id,
                 player_id=registration.player_id,
                 reason=registration.absence_reason or "Falta injustificada",
                 origin="unjustified_absence",
@@ -295,7 +345,7 @@ class BlacklistService:
     @staticmethod
     def list():
         from flask import request
-        query = BlacklistEntry.query
+        query = BlacklistEntry.query.filter_by(place_id=current_place().id)
         if request.args.get("active", "").lower() in {"true", "1"}:
             query = query.filter(BlacklistEntry.removed_at.is_(None))
         return paginate(query.order_by(BlacklistEntry.included_at.desc()), BlacklistService.serialize)
@@ -310,11 +360,12 @@ class BlacklistService:
     @staticmethod
     def add(data):
         require_fields(data, "player_id", "reason")
-        if not db.session.get(Player, data["player_id"]):
+        place = current_place()
+        if not PlacePlayer.query.filter_by(place_id=place.id, player_id=data["player_id"]).first():
             raise ApiError("Jogador não encontrado.", 404)
         if active_blacklist(data["player_id"]):
             raise ApiError("Jogador já está na Lista Negra.", 409)
-        entry = BlacklistEntry(player_id=data["player_id"], reason=str(data["reason"]).strip(),
+        entry = BlacklistEntry(place_id=place.id, player_id=data["player_id"], reason=str(data["reason"]).strip(),
                                origin=data.get("origin", "manual"), source_event_id=data.get("source_event_id"))
         db.session.add(entry)
         db.session.commit()

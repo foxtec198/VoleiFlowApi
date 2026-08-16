@@ -1,10 +1,11 @@
 from flask import Blueprint, request
 
-from models import BlacklistEntry, Event, OfflineOperation, Player, Position, Registration, Shift, TeamMember
+from models import BlacklistEntry, Event, OfflineOperation, PlacePlayer, Player, Position, Registration, Shift, TeamMember
 from services.auth import AuthService, admin_dict
 from services.catalog import PlayerService, PositionService, ShiftService, get_settings, update_settings
 from services.events import BlacklistService, EventService, RegistrationService, event_dict, registration_dict
 from services.formation import FormationService, formation_payload
+from services.places import PlaceService, current_place, place_dict
 from services.common import parse_datetime, utcnow
 from utils.auth import admin_required
 from utils.db import db
@@ -28,6 +29,27 @@ def get_or_404(model, item_id, label="Recurso"):
     return item
 
 
+def get_player_or_404(item_id):
+    membership = PlacePlayer.query.filter_by(place_id=current_place().id, player_id=item_id).first()
+    if not membership:
+        raise ApiError("Jogador não encontrado.", 404)
+    return membership.player
+
+
+def get_place_item_or_404(model, item_id, label):
+    item = db.session.get(model, item_id)
+    if not item or item.place_id != current_place().id:
+        raise ApiError(f"{label} não encontrado.", 404)
+    return item
+
+
+def get_registration_or_404(item_id):
+    item = db.session.get(Registration, item_id)
+    if not item or item.event.place_id != current_place().id:
+        raise ApiError("Inscrição não encontrada.", 404)
+    return item
+
+
 @api_bp.post("/auth/login")
 def admin_login():
     return AuthService.login(body())
@@ -48,13 +70,31 @@ def admin_logout():
 
 @api_bp.get("/public/bootstrap")
 def public_bootstrap():
-    upcoming = Event.query.filter(Event.status == "scheduled").order_by(Event.game_date, Event.starts_at).limit(20).all()
+    place = current_place()
+    upcoming = Event.query.filter(Event.place_id == place.id, Event.status == "scheduled").order_by(Event.game_date, Event.starts_at).limit(20).all()
     return {
+        "place": place_dict(place),
         "events": [event_dict(item) for item in upcoming],
         "positions": [item.to_dict() for item in Position.query.filter_by(active=True).order_by(Position.name)],
         "players": PlayerService.list(public=True),
         "settings": {"admin_whatsapp": get_settings()["admin_whatsapp"]},
     }
+
+
+@api_bp.get("/places")
+def places():
+    return PlaceService.list()
+
+
+@api_bp.get("/place")
+def place():
+    return place_dict(current_place())
+
+
+@api_bp.patch("/place")
+@admin_required
+def update_place():
+    return PlaceService.update(current_place(), body())
 
 
 @api_bp.get("/positions")
@@ -99,13 +139,13 @@ def create_player():
 @admin_required
 def player(item_id):
     from services.catalog import player_dict
-    return player_dict(get_or_404(Player, item_id, "Jogador"))
+    return player_dict(get_player_or_404(item_id))
 
 
 @api_bp.patch("/players/<int:item_id>")
 @admin_required
 def update_player(item_id):
-    return PlayerService.save(body(), get_or_404(Player, item_id, "Jogador"))
+    return PlayerService.save(body(), get_player_or_404(item_id))
 
 
 @api_bp.patch("/players/<int:item_id>/active")
@@ -113,13 +153,13 @@ def update_player(item_id):
 def activate_player(item_id):
     data = body()
     require_fields(data, "active")
-    return PlayerService.set_active(get_or_404(Player, item_id, "Jogador"), data["active"])
+    return PlayerService.set_active(get_player_or_404(item_id), data["active"])
 
 
 @api_bp.delete("/players/<int:item_id>")
 @admin_required
 def delete_player(item_id):
-    return PlayerService.set_active(get_or_404(Player, item_id, "Jogador"), False)
+    return PlayerService.set_active(get_player_or_404(item_id), False)
 
 
 @api_bp.get("/shifts")
@@ -136,13 +176,13 @@ def create_shift():
 @api_bp.patch("/shifts/<int:item_id>")
 @admin_required
 def update_shift(item_id):
-    return ShiftService.save(body(), get_or_404(Shift, item_id, "Turno"))
+    return ShiftService.save(body(), get_place_item_or_404(Shift, item_id, "Turno"))
 
 
 @api_bp.delete("/shifts/<int:item_id>")
 @admin_required
 def delete_shift(item_id):
-    item = get_or_404(Shift, item_id, "Turno")
+    item = get_place_item_or_404(Shift, item_id, "Turno")
     item.active = False
     db.session.commit()
     return item.to_dict()
@@ -180,20 +220,20 @@ def recurring_events():
 @api_bp.get("/events/<int:item_id>")
 @admin_required
 def event(item_id):
-    return event_dict(get_or_404(Event, item_id, "Evento"), detailed=True)
+    return event_dict(get_place_item_or_404(Event, item_id, "Evento"), detailed=True)
 
 
 @api_bp.patch("/events/<int:item_id>")
 @admin_required
 def update_event(item_id):
-    return EventService.save(body(), get_or_404(Event, item_id, "Evento"))
+    return EventService.save(body(), get_place_item_or_404(Event, item_id, "Evento"))
 
 
 @api_bp.delete("/events/<int:item_id>")
 @admin_required
 def cancel_event(item_id):
     return EventService.remove(
-        get_or_404(Event, item_id, "Evento"),
+        get_place_item_or_404(Event, item_id, "Evento"),
         request.args.get("scope", "single"),
     )
 
@@ -218,7 +258,7 @@ def registration_status(item_id):
     data = body()
     require_fields(data, "status")
     result = RegistrationService.update_status(
-        get_or_404(Registration, item_id, "Inscrição"), data["status"], data.get("reason")
+        get_registration_or_404(item_id), data["status"], data.get("reason")
     )
     socketio.emit("registration:changed", {"event_id": result["event_id"]})
     return result
@@ -227,7 +267,7 @@ def registration_status(item_id):
 @api_bp.patch("/registrations/<int:item_id>/notes")
 @admin_required
 def registration_notes(item_id):
-    item = get_or_404(Registration, item_id, "Inscrição")
+    item = get_registration_or_404(item_id)
     item.notes = str(body().get("notes", "")).strip() or None
     db.session.commit()
     return registration_dict(item, admin=True)
@@ -235,6 +275,8 @@ def registration_notes(item_id):
 
 @api_bp.get("/players/<int:player_id>/events/<int:event_id>/situation")
 def player_situation(player_id, event_id):
+    get_player_or_404(player_id)
+    get_place_item_or_404(Event, event_id, "Evento")
     registrations = Registration.query.filter_by(player_id=player_id, event_id=event_id).all()
     result = []
     for item in registrations:
@@ -261,7 +303,7 @@ def add_blacklist():
 @api_bp.delete("/blacklist/<int:item_id>")
 @admin_required
 def remove_blacklist(item_id):
-    return BlacklistService.remove(get_or_404(BlacklistEntry, item_id, "Bloqueio"), body().get("reason"))
+    return BlacklistService.remove(get_place_item_or_404(BlacklistEntry, item_id, "Bloqueio"), body().get("reason"))
 
 
 @api_bp.post("/events/<int:event_id>/shifts/<int:shift_id>/formation")
@@ -283,6 +325,8 @@ def move_team_member(item_id):
     data = body()
     require_fields(data, "team_id", "position_id")
     member = get_or_404(TeamMember, item_id, "Jogador escalado")
+    if member.team.event_id not in {item.id for item in Event.query.filter_by(place_id=current_place().id)}:
+        raise ApiError("Jogador escalado não encontrado.", 404)
     result = FormationService.move(member, data["team_id"], data["position_id"])
     socketio.emit("formation:changed", {"event_id": member.team.event_id, "shift_id": member.team.shift_id})
     return result
@@ -312,7 +356,7 @@ def sync_offline():
             continue
         try:
             payload = operation.get("payload", {})
-            registration = get_or_404(Registration, payload.get("registration_id"), "Inscrição")
+            registration = get_registration_or_404(payload.get("registration_id"))
             base_updated_at = payload.get("base_updated_at")
             server_updated_at = registration.updated_at
             if server_updated_at and server_updated_at.tzinfo is None:

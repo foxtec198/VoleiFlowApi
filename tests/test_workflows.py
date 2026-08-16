@@ -1,6 +1,6 @@
 from datetime import date, timedelta
 
-from models import Admin, BlacklistEntry, Event, Player, Registration
+from models import Admin, BlacklistEntry, Event, Place, PlacePlayer, Player, Registration
 from utils.db import db
 
 
@@ -151,3 +151,85 @@ def test_event_can_be_removed_individually_or_by_recurrence(client, app):
     with app.app_context():
         assert db.session.get(Event, items[0]["id"]).status == "deleted"
         assert db.session.get(Event, items[1]["id"]).status == "deleted"
+
+
+def test_guest_and_attendance_history_define_registration_priority(client, app):
+    position, shift, players, event = create_base(client, 3)
+    member, regular, guest = players
+    with app.app_context():
+        member_row = PlacePlayer.query.filter_by(player_id=member["id"]).one()
+        member_row.attendance_count = 3
+        guest_row = PlacePlayer.query.filter_by(player_id=guest["id"]).one()
+        guest_row.is_guest = True
+        db.session.commit()
+
+    member_registration = register(client, event, shift, position, member)
+    regular_registration = register(client, event, shift, position, regular)
+    guest_response = client.post("/api/registrations", json={
+        "event_id": event["id"], "shift_id": shift["id"], "player_id": guest["id"],
+        "primary_position_id": position["id"], "is_guest": True,
+    })
+    assert guest_response.status_code == 201
+    guest_registration = guest_response.get_json()
+
+    assert member_registration["priority_level"] == 1
+    assert member_registration["is_guest"] is False
+    assert guest_registration["priority_level"] == 3
+    assert guest_registration["is_guest"] is True
+    assert member_registration["status"] == "pending_confirmation"
+    assert regular_registration["status"] == "pending_confirmation"
+    assert guest_registration["status"] == "waitlist"
+
+    marked_present = client.patch(
+        f"/api/registrations/{guest_registration['id']}/status", json={"status": "present"}
+    )
+    assert marked_present.status_code == 200
+    with app.app_context():
+        assert PlacePlayer.query.filter_by(player_id=guest["id"]).one().attendance_count == 1
+
+    marked_absent = client.patch(
+        f"/api/registrations/{guest_registration['id']}/status",
+        json={"status": "justified_absence", "reason": "Avisou antes"},
+    )
+    assert marked_absent.status_code == 200
+    with app.app_context():
+        guest_row = PlacePlayer.query.filter_by(player_id=guest["id"]).one()
+        assert guest_row.attendance_count == 0
+        assert guest_row.absence_count == 1
+
+    public_guest = next(
+        item for item in client.get("/api/public/bootstrap").get_json()["players"]["items"]
+        if item["id"] == guest["id"]
+    )
+    assert public_guest["is_guest"] is True
+    assert "birth_date" not in public_guest
+    assert "attendance_count" not in public_guest
+
+
+def test_players_and_membership_are_isolated_by_place_route(client, app):
+    position, _shift, players, _event = create_base(client, 1)
+    with app.app_context():
+        db.session.add(Place(name="Outra quadra", slug="outra-quadra", active=True))
+        db.session.commit()
+
+    client.environ_base["HTTP_X_PLACE_SLUG"] = "outra-quadra"
+    assert client.get("/api/players?per_page=100").get_json()["pagination"]["total"] == 0
+    linked = client.post("/api/players", json={
+        "name": players[0]["name"], "email": players[0]["email"], "phone": players[0]["phone"],
+        "primary_position_id": position["id"], "is_guest": True,
+    })
+    assert linked.status_code == 201
+    assert linked.get_json()["is_guest"] is True
+
+    client.environ_base["HTTP_X_PLACE_SLUG"] = "nilo"
+    nilo_player = client.get(f"/api/players/{players[0]['id']}").get_json()
+    assert nilo_player["is_guest"] is False
+    with app.app_context():
+        assert PlacePlayer.query.filter_by(player_id=players[0]["id"]).count() == 2
+
+    updated_place = client.patch("/api/place", json={
+        "name": "Nilo", "slug": "nilo", "address": "Rua de teste, 10", "city": "Londrina", "state": "pr",
+    })
+    assert updated_place.status_code == 200
+    assert updated_place.get_json()["state"] == "PR"
+    assert client.get("/api/public/bootstrap").get_json()["place"]["address"] == "Rua de teste, 10"

@@ -24,6 +24,20 @@ class Admin(TimestampMixin, BaseModel):
     last_login = db.Column(db.DateTime(timezone=True))
 
 
+class Place(TimestampMixin, BaseModel):
+    __tablename__ = "places"
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(160), nullable=False)
+    slug = db.Column(db.String(80), nullable=False, unique=True, index=True)
+    address = db.Column(db.String(255))
+    neighborhood = db.Column(db.String(120))
+    city = db.Column(db.String(120))
+    state = db.Column(db.String(2))
+    postal_code = db.Column(db.String(12))
+    maps_url = db.Column(db.String(500))
+    active = db.Column(db.Boolean, nullable=False, default=True, index=True)
+
+
 event_shifts = db.Table(
     "event_shifts",
     db.Column("event_id", db.Integer, db.ForeignKey("events.id", ondelete="CASCADE"), primary_key=True),
@@ -46,6 +60,11 @@ class Player(TimestampMixin, BaseModel):
     email = db.Column(db.String(255), nullable=False, unique=True, index=True)
     phone = db.Column(db.String(30), nullable=False)
     active = db.Column(db.Boolean, nullable=False, default=True, index=True)
+    is_guest = db.Column(db.Boolean, nullable=False, default=False, index=True)
+    invited_by = db.Column(db.String(160))
+    birth_date = db.Column(db.Date)
+    attendance_count = db.Column(db.Integer, nullable=False, default=0)
+    absence_count = db.Column(db.Integer, nullable=False, default=0)
     primary_position_id = db.Column(db.Integer, db.ForeignKey("positions.id"), nullable=False, index=True)
     secondary_position_id = db.Column(db.Integer, db.ForeignKey("positions.id"), index=True)
     knowledge_level = db.Column(db.Integer, nullable=False, default=5)
@@ -59,10 +78,53 @@ class Player(TimestampMixin, BaseModel):
     primary_position = db.relationship("Position", foreign_keys=[primary_position_id])
     secondary_position = db.relationship("Position", foreign_keys=[secondary_position_id])
 
+    def priority_for(self, is_guest=None):
+        guest = self.is_guest if is_guest is None else bool(is_guest)
+        level = 3 if guest else 2
+        if (self.attendance_count or 0) >= 3:
+            level -= 1
+        if (self.absence_count or 0) > 0:
+            level += 1
+        return min(max(level, 1), 3)
+
+    @property
+    def priority_level(self):
+        return self.priority_for()
+
+
+class PlacePlayer(TimestampMixin, BaseModel):
+    __tablename__ = "place_players"
+    __table_args__ = (db.UniqueConstraint("place_id", "player_id", name="uq_place_player"),)
+    id = db.Column(db.Integer, primary_key=True)
+    place_id = db.Column(db.Integer, db.ForeignKey("places.id", ondelete="CASCADE"), nullable=False, index=True)
+    player_id = db.Column(db.Integer, db.ForeignKey("players.id", ondelete="CASCADE"), nullable=False, index=True)
+    active = db.Column(db.Boolean, nullable=False, default=True, index=True)
+    is_guest = db.Column(db.Boolean, nullable=False, default=False, index=True)
+    invited_by = db.Column(db.String(160))
+    attendance_count = db.Column(db.Integer, nullable=False, default=0)
+    absence_count = db.Column(db.Integer, nullable=False, default=0)
+
+    place = db.relationship("Place")
+    player = db.relationship("Player")
+
+    def priority_for(self, is_guest=None):
+        guest = self.is_guest if is_guest is None else bool(is_guest)
+        level = 3 if guest else 2
+        if (self.attendance_count or 0) >= 3:
+            level -= 1
+        if (self.absence_count or 0) > 0:
+            level += 1
+        return min(max(level, 1), 3)
+
+    @property
+    def priority_level(self):
+        return self.priority_for()
+
 
 class Shift(TimestampMixin, BaseModel):
     __tablename__ = "shifts"
     id = db.Column(db.Integer, primary_key=True)
+    place_id = db.Column(db.Integer, db.ForeignKey("places.id"), nullable=False, index=True)
     name = db.Column(db.String(100), nullable=False, unique=True)
     starts_at = db.Column(db.Time, nullable=False)
     ends_at = db.Column(db.Time, nullable=False)
@@ -72,6 +134,7 @@ class Shift(TimestampMixin, BaseModel):
 class Event(TimestampMixin, BaseModel):
     __tablename__ = "events"
     id = db.Column(db.Integer, primary_key=True)
+    place_id = db.Column(db.Integer, db.ForeignKey("places.id"), nullable=False, index=True)
     title = db.Column(db.String(160), nullable=False, default="Jogo de vôlei")
     game_date = db.Column(db.Date, nullable=False, index=True)
     starts_at = db.Column(db.Time, nullable=False)
@@ -103,6 +166,8 @@ class Registration(TimestampMixin, BaseModel):
     email_confirmation_token = db.Column(db.String(80), unique=True, index=True)
     email_confirmed_at = db.Column(db.DateTime(timezone=True))
     confirmed_at = db.Column(db.DateTime(timezone=True), index=True)
+    is_guest = db.Column(db.Boolean, nullable=False, default=False, index=True)
+    priority_level = db.Column(db.Integer, nullable=False, default=2, index=True)
     snapshot_name = db.Column(db.String(160), nullable=False)
     snapshot_knowledge_level = db.Column(db.Integer, nullable=False)
     snapshot_reception = db.Column(db.Integer, nullable=False)
@@ -129,6 +194,7 @@ class Registration(TimestampMixin, BaseModel):
 class BlacklistEntry(TimestampMixin, BaseModel):
     __tablename__ = "blacklist_entries"
     id = db.Column(db.Integer, primary_key=True)
+    place_id = db.Column(db.Integer, db.ForeignKey("places.id"), nullable=False, index=True)
     player_id = db.Column(db.Integer, db.ForeignKey("players.id"), nullable=False, index=True)
     reason = db.Column(db.Text, nullable=False)
     included_at = db.Column(db.DateTime(timezone=True), nullable=False, default=utcnow, index=True)
@@ -170,6 +236,15 @@ class TeamMember(TimestampMixin, BaseModel):
 class Setting(TimestampMixin, BaseModel):
     __tablename__ = "settings"
     key = db.Column(db.String(80), primary_key=True)
+    value = db.Column(db.JSON, nullable=False)
+
+
+class PlaceSetting(TimestampMixin, BaseModel):
+    __tablename__ = "place_settings"
+    __table_args__ = (db.UniqueConstraint("place_id", "key", name="uq_place_setting"),)
+    id = db.Column(db.Integer, primary_key=True)
+    place_id = db.Column(db.Integer, db.ForeignKey("places.id", ondelete="CASCADE"), nullable=False, index=True)
+    key = db.Column(db.String(80), nullable=False, index=True)
     value = db.Column(db.JSON, nullable=False)
 
 

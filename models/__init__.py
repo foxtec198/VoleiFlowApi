@@ -3,6 +3,9 @@ from models.domain import (
     BlacklistEntry,
     Event,
     OfflineOperation,
+    Place,
+    PlacePlayer,
+    PlaceSetting,
     Player,
     Position,
     Registration,
@@ -14,6 +17,6 @@ from models.domain import (
 )
 
 __all__ = [
-    "Admin", "BlacklistEntry", "Event", "OfflineOperation", "Player", "Position",
+    "Admin", "BlacklistEntry", "Event", "OfflineOperation", "Place", "PlacePlayer", "PlaceSetting", "Player", "Position",
     "Registration", "Setting", "Shift", "Team", "TeamMember", "event_shifts",
 ]
