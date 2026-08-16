@@ -4,7 +4,6 @@ import click
 from dotenv import load_dotenv
 from flask import Flask, jsonify
 from flask_cors import CORS
-from flask_migrate import Migrate
 from flask.cli import with_appcontext
 from utils.bps import blueprints
 from utils.db import db
@@ -12,7 +11,6 @@ from utils.errors import ApiError
 from utils.socekt import socketio
 load_dotenv()
 
-migrate = Migrate()
 
 def create_app(test_config=None):
     app = Flask(__name__)
@@ -36,7 +34,6 @@ def create_app(test_config=None):
 
     CORS(app, resources={r"/api/*": {"origins": "*"}})
     db.init_app(app)
-    migrate.init_app(app, db)
     socketio.init_app(app, cors_allowed_origins="*", async_mode="gevent")
 
     for bp, prefix in blueprints.items():
@@ -78,6 +75,31 @@ def create_app(test_config=None):
         db.session.add(admin)
         db.session.commit()
         click.echo(f"Administrador {email} criado com sucesso.")
+
+    @app.cli.command("init-db")
+    @with_appcontext
+    def init_db():
+        from models import Position, Setting
+
+        db.create_all()
+        defaults = [
+            ("Ponteiro", 2), ("Central", 2), ("Líbero", 1),
+            ("Levantador", 1), ("Oposto", 1),
+        ]
+        for name, required in defaults:
+            if not Position.query.filter(db.func.lower(Position.name) == name.lower()).first():
+                db.session.add(Position(name=name, required_per_team=required, active=True))
+        settings = {
+            "max_teams_per_event": 3,
+            "confirmation_deadline_days": 1,
+            "admin_whatsapp": "",
+            "imbalance_threshold": 1.5,
+        }
+        for key, value in settings.items():
+            if not db.session.get(Setting, key):
+                db.session.add(Setting(key=key, value=value))
+        db.session.commit()
+        click.echo("Banco inicializado sem remover ou sobrescrever registros existentes.")
 
     return app
 

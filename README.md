@@ -8,12 +8,12 @@ API Flask para cadastro de jogadores, eventos, inscrições, presença, Lista Ne
 python -m venv venv
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
 Copy-Item .env.example .env
-.\venv\Scripts\python.exe -m flask --app app db upgrade
+.\venv\Scripts\python.exe -m flask --app app init-db
 .\venv\Scripts\python.exe -m flask --app app create-admin
 .\venv\Scripts\python.exe app.py
 ```
 
-A API fica em `http://localhost:7000`. A migration inicial já cadastra as cinco posições padrão e as configurações gerais.
+A API fica em `http://localhost:7000`. O comando idempotente `init-db` cria tabelas ausentes e cadastra as posições/configurações padrão sem apagar ou sobrescrever registros existentes. Alterações estruturais no banco de produção são administradas diretamente e não usam arquivos de migration versionados.
 
 O comando `create-admin` solicita nome, e-mail e senha de forma interativa. A senha deve conter maiúscula, minúscula, número e símbolo.
 
