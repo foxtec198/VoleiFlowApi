@@ -1,6 +1,7 @@
 from datetime import date, datetime, timedelta, timezone
 
 from models import Admin, BlacklistEntry, Event, Place, PlacePlayer, Player, Registration
+from services.mailer import confirmation_email_html, public_app_url
 from utils.db import db
 
 
@@ -133,6 +134,27 @@ def test_admin_login_requires_argon2id_pepper_and_jwt(client, app):
         admin = Admin.query.filter_by(email="admin@example.com").one()
         assert admin.password_hash.startswith("$argon2id$")
         assert password not in admin.password_hash
+
+
+def test_confirmation_email_uses_public_request_origin_when_app_url_is_local(client, app):
+    with app.test_request_context(
+        "/api/registrations",
+        base_url="https://voleiflow.exemplo.com",
+    ):
+        assert public_app_url() == "https://voleiflow.exemplo.com"
+
+    with app.app_context():
+        place = Place.query.filter_by(slug="nilo").one()
+        _position, _shift, players, event = create_base(client, 1)
+        html = confirmation_email_html(
+            type("Player", (), {"name": players[0]["name"]})(),
+            type("Event", (), {"title": event["title"], "game_date": date.fromisoformat(event["game_date"]), "starts_at": datetime.strptime(event["starts_at"], "%H:%M:%S").time()})(),
+            place,
+            "https://voleiflow.exemplo.com/nilo/confirmar/token",
+        )
+        assert "Confirmar presença" in html
+        assert "©" in html
+        assert "localhost" not in html
 
 
 def test_event_can_be_removed_individually_or_by_recurrence(client, app):
