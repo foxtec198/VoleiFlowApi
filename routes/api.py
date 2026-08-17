@@ -72,7 +72,14 @@ def admin_logout():
 def public_bootstrap():
     place = current_place()
     EventService.materialize_recurring(place.id)
-    upcoming = Event.query.filter(Event.place_id == place.id, Event.status == "scheduled").order_by(Event.game_date, Event.starts_at).limit(20).all()
+    # A tela pública de inscrição só recebe ocorrências cuja abertura já chegou.
+    # O painel administrativo usa /events e, por isso, continua enxergando toda
+    # a agenda recorrente, inclusive jogos com inscrição ainda fechada.
+    upcoming = Event.query.filter(
+        Event.place_id == place.id,
+        Event.status == "scheduled",
+        Event.registration_opens_at <= utcnow(),
+    ).order_by(Event.game_date, Event.starts_at).limit(20).all()
     return {
         "place": place_dict(place),
         "events": [event_dict(item) for item in upcoming],

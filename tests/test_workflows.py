@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from models import Admin, BlacklistEntry, Event, Place, PlacePlayer, Player, Registration
 from utils.db import db
@@ -66,6 +66,11 @@ def test_confirmation_formation_and_balance(client, app):
     assert all(len(team["members"]) == 1 for team in data["teams"])
     assert data["missing"] == []
     assert data["differences"]["overall"] == 1.0
+    whatsapp = client.get(f"/api/events/{event['id']}/shifts/{shift['id']}/whatsapp")
+    assert whatsapp.status_code == 200
+    assert "🏐 *VÔLEI NILO*" in whatsapp.get_json()["text"]
+    assert "📊 *RESUMO DE INSCRIÇÕES*" in whatsapp.get_json()["text"]
+    assert "✅ Com vaga no time: 2" in whatsapp.get_json()["text"]
 
 
 def test_unjustified_absence_blacklists_and_removal_preserves_history(client, app):
@@ -183,6 +188,40 @@ def test_unlimited_recurrence_has_no_occurrence_limit_and_stops_when_removed(cli
     assert all(item["recurrence_group"] != items[0]["recurrence_group"] for item in refreshed["recurrences"])
     with app.app_context():
         assert Event.query.filter_by(recurrence_group=items[0]["recurrence_group"], status="scheduled").count() == 0
+
+
+def test_public_signup_only_receives_events_after_each_occurrence_opens(client):
+    _position, shift, _players, _event = create_base(client, 0)
+    first_game = date.today() + timedelta(days=2)
+    second_game = first_game + timedelta(days=7)
+    first_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+    response = client.post("/api/events/recurring", json={
+        "title": "Jogo semanal",
+        "dates": [first_game.isoformat(), second_game.isoformat()],
+        "game_date": first_game.isoformat(),
+        "starts_at": "19:00",
+        "registration_opens_at": first_open.isoformat(),
+        "team_count": 2,
+        "shift_ids": [shift["id"]],
+    })
+
+    assert response.status_code == 201
+    occurrences = response.get_json()["items"]
+    first, second = sorted(occurrences, key=lambda item: item["game_date"])
+    first_open_at = datetime.fromisoformat(first["registration_opens_at"].replace("Z", "+00:00"))
+    second_open_at = datetime.fromisoformat(second["registration_opens_at"].replace("Z", "+00:00"))
+    assert second_open_at - first_open_at == timedelta(days=7)
+
+    public_events = client.get("/api/public/bootstrap").get_json()["events"]
+    public_ids = {item["id"] for item in public_events}
+    assert first["id"] in public_ids
+    assert second["id"] not in public_ids
+
+    admin_events = client.get("/api/events?per_page=100").get_json()["items"]
+    admin_ids = {item["id"] for item in admin_events}
+    assert first["id"] in admin_ids
+    assert second["id"] in admin_ids
 
 
 def test_guest_and_attendance_history_define_registration_priority(client, app):

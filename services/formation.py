@@ -221,22 +221,78 @@ class FormationService:
         payload = formation_payload(event_id, shift_id)
         if not event or not payload["teams"]:
             raise ApiError("Formação ainda não disponível.", 404)
-        shift = next((item for item in event.shifts if item.id == shift_id), None)
-        periods = " + ".join(
-            f"{item['name']} ({item['starts_at'][:5]}–{item['ends_at'][:5]})"
-            for item in payload["linked_shifts"]
-        )
-        lines = [f"🏐 {event.title}", f"📅 {event.game_date:%d/%m/%Y} às {event.starts_at:%H:%M}",
-                 f"🕐 Períodos: {periods or (shift.name if shift else '-')}", ""]
-        for team in payload["teams"]:
-            lines.append(f"*{team['name']}*")
-            for member in team["members"]:
-                selected = ", ".join(period["name"] for period in member["registration"]["selected_periods"])
-                lines.append(f"• {member['registration']['player_name']} — {member['position']} ({selected})")
-            lines.append("")
-        if payload["waitlist"]:
-            lines.append("*Lista de espera*")
-            lines.extend(f"• {item['player_name']} — {item['primary_position']}" for item in payload["waitlist"])
+        group_ids = [item["id"] for item in payload["linked_shifts"]]
+        registrations = Registration.query.filter(
+            Registration.event_id == event_id,
+            Registration.shift_id.in_(group_ids),
+        ).order_by(Registration.shift_id, Registration.priority_level, Registration.snapshot_name).all()
+        active_statuses = {"confirmed", "pending_confirmation", "present"}
+        active_registrations = [item for item in registrations if item.status in active_statuses]
+        waiting = [item for item in registrations if item.status == "waitlist"]
+        pending = [item for item in registrations if item.status == "pending_confirmation"]
+        unavailable = [item for item in registrations if item.status not in active_statuses | {"waitlist"}]
+        assigned_player_ids = {
+            member["registration"]["player_id"]
+            for team in payload["teams"]
+            for member in team["members"]
+        }
+        place = current_place()
+        separator = "━━━━━━━━━━━━━━"
+        lines = [
+            f"🏐 *VÔLEI {place.name.upper()}*",
+            f"📅 *{event.title}* — {event.game_date:%d/%m/%Y}",
+            f"🕐 {event.starts_at:%H:%M}",
+            "",
+            "📊 *RESUMO DE INSCRIÇÕES*",
+            f"👥 Inscritos: {len(active_registrations)}",
+            f"✅ Com vaga no time: {len(assigned_player_ids)}",
+            f"⏳ Lista de espera: {len(waiting)}",
+            f"🟡 Aguardando confirmação: {len(pending)}",
+            f"❌ Cancelados/ausentes: {len(unavailable)}",
+            "",
+            separator,
+            "",
+        ]
+
+        emoji_by_status = {
+            "confirmed": "✅",
+            "present": "✅",
+            "pending_confirmation": "🟡",
+        }
+        for index, period in enumerate(payload["linked_shifts"]):
+            period_registrations = [
+                item for item in active_registrations if item.shift_id == period["id"]
+            ]
+            lines.append(
+                f"{'🟢' if index % 2 == 0 else '🔵'} *{period['name'].upper()}* "
+                f"({period['starts_at'][:5]} às {period['ends_at'][:5]}) "
+                f"— {len(period_registrations)}"
+            )
+            if period_registrations:
+                for registration in period_registrations:
+                    lines.append(
+                        f"{emoji_by_status[registration.status]} {registration.snapshot_name} "
+                        f"— {registration.primary_position.name}"
+                    )
+            else:
+                lines.append("▫️ Nenhum inscrito neste período.")
+            lines.extend(["", separator, ""])
+
+        if waiting:
+            lines.append(f"⏳ *LISTA DE ESPERA* ({len(waiting)})")
+            lines.extend(
+                f"⏳ {registration.snapshot_name} — {registration.primary_position.name}"
+                for registration in waiting
+            )
+            lines.extend(["", separator, ""])
+
+        if unavailable:
+            lines.append(f"❌ *CANCELADOS/AUSENTES* ({len(unavailable)})")
+            lines.extend(
+                f"❌ {registration.snapshot_name} — {registration.primary_position.name}"
+                for registration in unavailable
+            )
+            lines.extend(["", separator, ""])
         vacancies = []
         positions = Position.query.filter(Position.active.is_(True), Position.required_per_team > 0).all()
         for team in payload["teams"]:
@@ -245,5 +301,5 @@ class FormationService:
                 if occupied < position.required_per_team:
                     vacancies.append(f"• {team['name']}: {position.required_per_team - occupied} vaga(s) de {position.name}")
         if vacancies:
-            lines.extend(["", "*Vagas disponíveis*", *vacancies])
+            lines.extend(["🪑 *VAGAS DISPONÍVEIS*", *vacancies])
         return {"text": "\n".join(lines).strip()}
