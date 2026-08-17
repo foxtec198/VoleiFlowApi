@@ -71,12 +71,13 @@ def admin_logout():
 @api_bp.get("/public/bootstrap")
 def public_bootstrap():
     place = current_place()
+    EventService.materialize_recurring(place.id)
     upcoming = Event.query.filter(Event.place_id == place.id, Event.status == "scheduled").order_by(Event.game_date, Event.starts_at).limit(20).all()
     return {
         "place": place_dict(place),
         "events": [event_dict(item) for item in upcoming],
         "positions": [item.to_dict() for item in Position.query.filter_by(active=True).order_by(Position.name)],
-        "players": PlayerService.list(public=True),
+        "players": PlayerService.list(public=True, include_email=True),
         "settings": {"admin_whatsapp": get_settings()["admin_whatsapp"]},
     }
 
@@ -84,6 +85,11 @@ def public_bootstrap():
 @api_bp.get("/places")
 def places():
     return PlaceService.list()
+
+
+@api_bp.get("/public/players")
+def public_players():
+    return PlayerService.list(public=True, include_email=True)
 
 
 @api_bp.get("/place")

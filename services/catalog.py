@@ -13,7 +13,7 @@ def position_dict(position):
     return position.to_dict()
 
 
-def player_dict(player, private=True, membership=None):
+def player_dict(player, private=True, membership=None, include_email=False):
     membership = membership or PlacePlayer.query.filter_by(
         place_id=current_place().id, player_id=player.id
     ).first()
@@ -34,6 +34,8 @@ def player_dict(player, private=True, membership=None):
     if not private:
         for field in ("email", "phone", "birth_date", "invited_by", "attendance_count", "absence_count", *SKILL_FIELDS):
             data.pop(field, None)
+        if include_email:
+            data["email"] = player.email
     return data
 
 
@@ -67,7 +69,7 @@ class PositionService:
 
 class PlayerService:
     @staticmethod
-    def list(public=False):
+    def list(public=False, include_email=False):
         from flask import request
         place = current_place()
         query = Player.query.join(PlacePlayer, PlacePlayer.player_id == Player.id).filter(PlacePlayer.place_id == place.id)
@@ -81,6 +83,7 @@ class PlayerService:
         return paginate(query.order_by(Player.name), lambda item: player_dict(
             item, private=not public,
             membership=PlacePlayer.query.filter_by(place_id=place.id, player_id=item.id).one(),
+            include_email=include_email,
         ))
 
     @staticmethod

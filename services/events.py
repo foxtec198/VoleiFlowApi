@@ -1,6 +1,6 @@
 import secrets
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -17,6 +17,7 @@ REGISTRATION_STATUSES = {
     "confirmed", "pending_confirmation", "waitlist", "cancelled", "present",
     "justified_absence", "unjustified_absence",
 }
+RECURRENCE_HORIZON_DAYS = 120
 
 
 def event_dict(event, detailed=False):
@@ -79,16 +80,107 @@ def vacancy_summary(event, registrations=None):
 
 class EventService:
     @staticmethod
+    def materialize_recurring(place_id=None, horizon_days=RECURRENCE_HORIZON_DAYS):
+        place_id = place_id or current_place().id
+        groups = db.session.query(Event.recurrence_group).filter(
+            Event.place_id == place_id,
+            Event.recurrence_group.isnot(None),
+            Event.recurrence_rule.isnot(None),
+            Event.status != "deleted",
+        ).distinct().all()
+        created = []
+        for (group,) in groups:
+            template = Event.query.filter(
+                Event.place_id == place_id,
+                Event.recurrence_group == group,
+                Event.status != "deleted",
+            ).order_by(Event.game_date, Event.id).first()
+            rule = (template.recurrence_rule or {}) if template else {}
+            if not template or not rule.get("unlimited"):
+                continue
+            weekdays = {int(day) for day in rule.get("weekdays", [])}
+            if not weekdays:
+                continue
+            start_date = parse_date(rule.get("start_date") or template.game_date.isoformat(), "start_date")
+            horizon = max(date.today(), start_date) + timedelta(days=horizon_days)
+            existing_dates = {
+                row.game_date for row in Event.query.filter_by(place_id=place_id, recurrence_group=group).all()
+            }
+            cursor = max(start_date, date.today())
+            while cursor <= horizon:
+                if cursor.weekday() in weekdays and cursor not in existing_dates:
+                    day_delta = timedelta(days=(cursor - template.game_date).days)
+                    occurrence = Event(
+                        place_id=place_id,
+                        title=template.title,
+                        game_date=cursor,
+                        starts_at=template.starts_at,
+                        registration_opens_at=template.registration_opens_at + day_delta,
+                        confirmation_deadline=template.confirmation_deadline + day_delta,
+                        team_count=template.team_count,
+                        status="scheduled",
+                        recurrence_group=group,
+                        recurrence_rule=rule,
+                        shifts=list(template.shifts),
+                    )
+                    db.session.add(occurrence)
+                    created.append(occurrence)
+                    existing_dates.add(cursor)
+                cursor += timedelta(days=1)
+        if created:
+            db.session.commit()
+        return created
+
+    @staticmethod
+    def recurrence_summaries(place_id=None):
+        place_id = place_id or current_place().id
+        groups = db.session.query(Event.recurrence_group).filter(
+            Event.place_id == place_id,
+            Event.recurrence_group.isnot(None),
+            Event.status != "deleted",
+        ).distinct().all()
+        summaries = []
+        for (group,) in groups:
+            occurrences = Event.query.filter(
+                Event.place_id == place_id,
+                Event.recurrence_group == group,
+                Event.status != "deleted",
+            ).order_by(Event.game_date, Event.starts_at).all()
+            if not occurrences:
+                continue
+            template = occurrences[0]
+            upcoming = next((item for item in occurrences if item.game_date >= date.today()), template)
+            rule = template.recurrence_rule or {}
+            summaries.append({
+                "recurrence_group": group,
+                "representative_event_id": upcoming.id,
+                "title": template.title,
+                "starts_at": template.starts_at.isoformat(),
+                "start_date": rule.get("start_date") or template.game_date.isoformat(),
+                "next_date": upcoming.game_date.isoformat(),
+                "materialized_until": occurrences[-1].game_date.isoformat(),
+                "weekdays": rule.get("weekdays", []),
+                "unlimited": bool(rule.get("unlimited")),
+                "occurrences_created": len(occurrences),
+                "shifts": [shift.to_dict() for shift in template.shifts],
+            })
+        return summaries
+
+    @staticmethod
     def list():
         from flask import request
-        query = Event.query.filter_by(place_id=current_place().id)
+        place = current_place()
+        EventService.materialize_recurring(place.id)
+        query = Event.query.filter_by(place_id=place.id)
         if request.args.get("status"):
             query = query.filter_by(status=request.args["status"])
         else:
             query = query.filter(Event.status != "deleted")
         if request.args.get("from"):
             query = query.filter(Event.game_date >= parse_date(request.args["from"], "from"))
-        return paginate(query.order_by(Event.game_date.desc(), Event.starts_at), event_dict)
+        result = paginate(query.order_by(Event.game_date.desc(), Event.starts_at), event_dict)
+        result["recurrences"] = EventService.recurrence_summaries(place.id)
+        return result
 
     @staticmethod
     def remove(event, scope="single"):
@@ -150,26 +242,50 @@ class EventService:
 
     @staticmethod
     def create_recurring(data):
-        dates = data.get("dates", [])
+        dates = list(data.get("dates", []))
+        unlimited = not bool(dates)
         if not dates:
-            require_fields(data, "start_date", "occurrences", "weekdays")
+            require_fields(data, "start_date", "weekdays")
             cursor = parse_date(data["start_date"], "start_date")
             weekdays = {int(day) for day in data["weekdays"]}
-            occurrences = min(int(data["occurrences"]), 52)
-            while len(dates) < occurrences:
+            if not weekdays or any(day < 0 or day > 6 for day in weekdays):
+                raise ApiError("Selecione ao menos um dia válido para a recorrência.", 422)
+            horizon = max(date.today(), cursor) + timedelta(days=RECURRENCE_HORIZON_DAYS)
+            while cursor <= horizon:
                 if cursor.weekday() in weekdays:
                     dates.append(cursor.isoformat())
                 cursor += timedelta(days=1)
+            if not dates:
+                raise ApiError("A recorrência não possui datas dentro da janela de programação.", 422)
         group = str(uuid.uuid4())
         created = []
+        base_game_date = parse_date(data.get("game_date") or data.get("start_date") or dates[0], "game_date")
+        base_registration_opens = parse_datetime(data["registration_opens_at"], "registration_opens_at")
+        base_confirmation_deadline = parse_datetime(
+            data["confirmation_deadline"], "confirmation_deadline"
+        ) if data.get("confirmation_deadline") else None
+        rule = {
+            "frequency": "weekly",
+            "weekdays": sorted(int(day) for day in data.get("weekdays", [])),
+            "start_date": data.get("start_date") or dates[0],
+            "unlimited": unlimited,
+        }
         try:
-            for raw_date in dates[:52]:
-                payload = {**data, "game_date": raw_date}
+            for raw_date in dates:
+                occurrence_date = parse_date(raw_date, "game_date")
+                day_delta = timedelta(days=(occurrence_date - base_game_date).days)
+                payload = {
+                    **data,
+                    "game_date": occurrence_date.isoformat(),
+                    "registration_opens_at": (base_registration_opens + day_delta).isoformat(),
+                }
+                if base_confirmation_deadline:
+                    payload["confirmation_deadline"] = (base_confirmation_deadline + day_delta).isoformat()
                 payload.pop("dates", None)
                 event_data = EventService.save(payload)
                 event = db.session.get(Event, event_data["id"])
                 event.recurrence_group = group
-                event.recurrence_rule = {key: data.get(key) for key in ("weekdays", "occurrences")}
+                event.recurrence_rule = rule
                 created.append(event)
             db.session.commit()
         except Exception:

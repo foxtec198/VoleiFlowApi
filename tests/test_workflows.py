@@ -153,6 +153,38 @@ def test_event_can_be_removed_individually_or_by_recurrence(client, app):
         assert db.session.get(Event, items[1]["id"]).status == "deleted"
 
 
+def test_unlimited_recurrence_has_no_occurrence_limit_and_stops_when_removed(client, app):
+    _position, shift, _players, _event = create_base(client, 0)
+    start = date.today() + timedelta(days=1)
+    response = client.post("/api/events/recurring", json={
+        "title": "Treino semanal permanente",
+        "start_date": start.isoformat(),
+        "game_date": start.isoformat(),
+        "weekdays": [start.weekday()],
+        "starts_at": "19:00",
+        "registration_opens_at": f"{date.today().isoformat()}T00:00:00-03:00",
+        "team_count": 2,
+        "shift_ids": [shift["id"]],
+    })
+    assert response.status_code == 201
+    items = response.get_json()["items"]
+    assert len(items) > 10
+    assert all(item["recurrence_rule"]["unlimited"] is True for item in items)
+    assert all("occurrences" not in item["recurrence_rule"] for item in items)
+
+    listing = client.get("/api/events?per_page=100").get_json()
+    recurrence = next(item for item in listing["recurrences"] if item["recurrence_group"] == items[0]["recurrence_group"])
+    assert recurrence["unlimited"] is True
+    assert recurrence["occurrences_created"] == len(items)
+
+    removed = client.delete(f"/api/events/{items[0]['id']}?scope=recurrence").get_json()
+    assert removed["removed_count"] == len(items)
+    refreshed = client.get("/api/events?per_page=100").get_json()
+    assert all(item["recurrence_group"] != items[0]["recurrence_group"] for item in refreshed["recurrences"])
+    with app.app_context():
+        assert Event.query.filter_by(recurrence_group=items[0]["recurrence_group"], status="scheduled").count() == 0
+
+
 def test_guest_and_attendance_history_define_registration_priority(client, app):
     position, shift, players, event = create_base(client, 3)
     member, regular, guest = players
@@ -234,6 +266,26 @@ def test_players_and_membership_are_isolated_by_place_route(client, app):
     assert updated_place.get_json()["state"] == "PR"
     assert client.get("/api/public/bootstrap").get_json()["place"]["address"] == "Rua de teste, 10"
 
+
+def test_public_player_search_is_limited_and_returns_name_with_email(client):
+    position, _shift, _players, _event = create_base(client, 0)
+    for index in range(30):
+        response = client.post("/api/players", json={
+            "name": f"Jogador {index:02d}",
+            "email": f"busca{index:02d}@example.com",
+            "phone": f"4399999{index:04d}",
+            "primary_position_id": position["id"],
+        })
+        assert response.status_code == 201
+
+    initial = client.get("/api/public/players?per_page=25").get_json()
+    assert len(initial["items"]) == 25
+    assert initial["pagination"]["total"] == 30
+    assert set(initial["items"][0]).issuperset({"id", "name", "email"})
+    assert "phone" not in initial["items"][0]
+
+    searched = client.get("/api/public/players?per_page=25&search=busca27@example.com").get_json()
+    assert [item["email"] for item in searched["items"]] == ["busca27@example.com"]
 
 def test_overlapping_shifts_share_formation_and_expose_selected_periods(client):
     position, late_shift, players, _original_event = create_base(client, 3)
