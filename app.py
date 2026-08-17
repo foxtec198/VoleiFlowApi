@@ -17,6 +17,10 @@ def create_app(test_config=None):
     app.config.update(
         SECRET_KEY=os.getenv("SECRET", ""),
         SQLALCHEMY_DATABASE_URI=os.getenv("DB_URI", "sqlite:///voleiflow.db"),
+        SQLALCHEMY_ENGINE_OPTIONS={
+            "pool_pre_ping": True,
+            "pool_recycle": 240,
+        },
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
         JSON_SORT_KEYS=False,
         PASSWORD_PEPPER=os.getenv("PASSWORD_PEPPER", ""),
