@@ -31,10 +31,38 @@ def team_metrics(team):
     return metrics
 
 
-def team_dict(team, include_private=False):
+def shift_period_dict(shift):
+    return {
+        "id": shift.id,
+        "name": shift.name,
+        "starts_at": shift.starts_at.isoformat(),
+        "ends_at": shift.ends_at.isoformat(),
+    }
+
+
+def linked_shifts(event, shift_id):
+    selected = next((shift for shift in event.shifts if shift.id == shift_id), None)
+    if not selected:
+        raise ApiError("Evento ou turno inválido.", 404)
+    connected = {selected.id}
+    pending = [selected]
+    while pending:
+        current = pending.pop()
+        for shift in event.shifts:
+            overlaps = current.starts_at < shift.ends_at and shift.starts_at < current.ends_at
+            if shift.id not in connected and overlaps:
+                connected.add(shift.id)
+                pending.append(shift)
+    return sorted((shift for shift in event.shifts if shift.id in connected), key=lambda item: (item.starts_at, item.id))
+
+
+def team_dict(team, include_private=False, periods_by_player=None):
     members = []
     for member in sorted(team.members, key=lambda item: (item.position.name, item.registration.snapshot_name)):
         registration = registration_dict(member.registration, admin=include_private)
+        registration["selected_periods"] = (periods_by_player or {}).get(member.registration.player_id, [
+            shift_period_dict(member.registration.shift)
+        ])
         members.append({"id": member.id, "position_id": member.position_id,
                         "position": member.position.name, "registration": registration})
     return {**team.to_dict(), "members": members, "metrics": team_metrics(team)}
@@ -44,25 +72,43 @@ def formation_payload(event_id, shift_id):
     event = db.session.get(Event, event_id)
     if not event or event.place_id != current_place().id:
         raise ApiError("Evento ou turno inválido.", 404)
-    teams = Team.query.filter_by(event_id=event_id, shift_id=shift_id).order_by(Team.number).all()
+    group_shifts = linked_shifts(event, shift_id)
+    group_ids = [shift.id for shift in group_shifts]
+    formation_shift_id = group_shifts[0].id
+    registrations = Registration.query.filter(
+        Registration.event_id == event_id,
+        Registration.shift_id.in_(group_ids),
+        Registration.status != "cancelled",
+    ).order_by(Registration.created_at, Registration.id).all()
+    periods_by_player = defaultdict(list)
+    for registration in registrations:
+        period = shift_period_dict(registration.shift)
+        if period not in periods_by_player[registration.player_id]:
+            periods_by_player[registration.player_id].append(period)
+    teams = Team.query.filter_by(event_id=event_id, shift_id=formation_shift_id).order_by(Team.number).all()
     metrics = [team_metrics(team) for team in teams]
     differences = {}
     for label in METRICS:
         values = [item[label] for item in metrics]
         differences[label] = round(max(values) - min(values), 2) if values else 0
-    assigned_ids = {member.registration_id for team in teams for member in team.members}
-    waitlist = Registration.query.filter(
-        Registration.event_id == event_id,
-        Registration.shift_id == shift_id,
-        ~Registration.id.in_(assigned_ids) if assigned_ids else True,
-        Registration.status != "cancelled",
-    ).order_by(Registration.created_at).all()
+    assigned_player_ids = {member.registration.player_id for team in teams for member in team.members}
+    waitlist = []
+    waiting_players = set()
+    for registration in registrations:
+        if registration.player_id in assigned_player_ids or registration.player_id in waiting_players:
+            continue
+        waiting_players.add(registration.player_id)
+        row = registration_dict(registration)
+        row["selected_periods"] = periods_by_player[registration.player_id]
+        waitlist.append(row)
     return {
         "event_id": event_id,
         "shift_id": shift_id,
-        "teams": [team_dict(team, include_private=True) for team in teams],
+        "formation_shift_id": formation_shift_id,
+        "linked_shifts": [shift_period_dict(shift) for shift in group_shifts],
+        "teams": [team_dict(team, periods_by_player=periods_by_player) for team in teams],
         "differences": differences,
-        "waitlist": [registration_dict(item) for item in waitlist],
+        "waitlist": waitlist,
     }
 
 
@@ -70,11 +116,14 @@ class FormationService:
     @staticmethod
     def generate(event_id, shift_id):
         event = db.session.get(Event, event_id)
-        if not event or event.place_id != current_place().id or shift_id not in {shift.id for shift in event.shifts}:
+        if not event or event.place_id != current_place().id:
             raise ApiError("Evento ou turno inválido.", 404)
+        group_shifts = linked_shifts(event, shift_id)
+        group_ids = [shift.id for shift in group_shifts]
+        formation_shift_id = group_shifts[0].id
         candidates = Registration.query.filter(
             Registration.event_id == event_id,
-            Registration.shift_id == shift_id,
+            Registration.shift_id.in_(group_ids),
             Registration.status.in_(["confirmed", "pending_confirmation", "present"]),
         ).all()
         candidates.sort(key=lambda item: (
@@ -84,13 +133,19 @@ class FormationService:
             item.created_at,
             item.id,
         ))
+        unique_candidates = {}
+        for candidate in candidates:
+            unique_candidates.setdefault(candidate.player_id, candidate)
+        candidates = list(unique_candidates.values())
         positions = Position.query.filter(Position.active.is_(True), Position.required_per_team > 0).order_by(Position.id).all()
-        existing_team_ids = [item.id for item in Team.query.filter_by(event_id=event_id, shift_id=shift_id)]
+        existing_team_ids = [item.id for item in Team.query.filter(
+            Team.event_id == event_id, Team.shift_id.in_(group_ids)
+        )]
         if existing_team_ids:
             TeamMember.query.filter(TeamMember.team_id.in_(existing_team_ids)).delete(synchronize_session=False)
             Team.query.filter(Team.id.in_(existing_team_ids)).delete(synchronize_session=False)
         db.session.flush()
-        teams = [Team(event_id=event_id, shift_id=shift_id, number=number, name=f"Time {number}")
+        teams = [Team(event_id=event_id, shift_id=formation_shift_id, number=number, name=f"Time {number}")
                  for number in range(1, event.team_count + 1)]
         db.session.add_all(teams)
         db.session.flush()
@@ -167,12 +222,17 @@ class FormationService:
         if not event or not payload["teams"]:
             raise ApiError("Formação ainda não disponível.", 404)
         shift = next((item for item in event.shifts if item.id == shift_id), None)
+        periods = " + ".join(
+            f"{item['name']} ({item['starts_at'][:5]}–{item['ends_at'][:5]})"
+            for item in payload["linked_shifts"]
+        )
         lines = [f"🏐 {event.title}", f"📅 {event.game_date:%d/%m/%Y} às {event.starts_at:%H:%M}",
-                 f"🕐 Turno: {shift.name if shift else '-'}", ""]
+                 f"🕐 Períodos: {periods or (shift.name if shift else '-')}", ""]
         for team in payload["teams"]:
             lines.append(f"*{team['name']}*")
             for member in team["members"]:
-                lines.append(f"• {member['registration']['player_name']} — {member['position']}")
+                selected = ", ".join(period["name"] for period in member["registration"]["selected_periods"])
+                lines.append(f"• {member['registration']['player_name']} — {member['position']} ({selected})")
             lines.append("")
         if payload["waitlist"]:
             lines.append("*Lista de espera*")

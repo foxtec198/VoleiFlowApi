@@ -233,3 +233,45 @@ def test_players_and_membership_are_isolated_by_place_route(client, app):
     assert updated_place.status_code == 200
     assert updated_place.get_json()["state"] == "PR"
     assert client.get("/api/public/bootstrap").get_json()["place"]["address"] == "Rua de teste, 10"
+
+
+def test_overlapping_shifts_share_formation_and_expose_selected_periods(client):
+    position, late_shift, players, _original_event = create_base(client, 3)
+    early_shift = client.post("/api/shifts", json={
+        "name": "Início", "starts_at": "15:00", "ends_at": "18:00",
+    }).get_json()
+    middle_shift = client.post("/api/shifts", json={
+        "name": "Meio", "starts_at": "17:00", "ends_at": "20:00",
+    }).get_json()
+    game_date = date.today() + timedelta(days=14)
+    event = client.post("/api/events", json={
+        "title": "Rachão integrado", "game_date": game_date.isoformat(), "starts_at": "15:00",
+        "registration_opens_at": f"{date.today().isoformat()}T00:00:00-03:00",
+        "team_count": 3, "shift_ids": [early_shift["id"], middle_shift["id"], late_shift["id"]],
+    }).get_json()
+    selected_shifts = [early_shift, middle_shift, late_shift]
+    for player, shift in zip(players, selected_shifts):
+        register(client, event, shift, position, player)
+
+    generated = client.post(f"/api/events/{event['id']}/shifts/{early_shift['id']}/formation")
+    assert generated.status_code == 200
+    formation = generated.get_json()
+    assert [item["id"] for item in formation["linked_shifts"]] == [item["id"] for item in selected_shifts]
+    assert sum(len(team["members"]) for team in formation["teams"]) == 3
+    periods = {
+        member["registration"]["player_name"]: member["registration"]["selected_periods"][0]["name"]
+        for team in formation["teams"] for member in team["members"]
+    }
+    assert periods == {players[index]["name"]: selected_shifts[index]["name"] for index in range(3)}
+
+    same_formation = client.get(f"/api/events/{event['id']}/shifts/{late_shift['id']}/formation").get_json()
+    assert [team["id"] for team in same_formation["teams"]] == [team["id"] for team in formation["teams"]]
+
+    situation = client.get(f"/api/players/{players[0]['id']}/events/{event['id']}/situation").get_json()
+    assert situation["items"][0]["selected_period"]["name"] == early_shift["name"]
+    assert len(situation["formations"]) == 1
+    visible_players = {
+        member["registration"]["player_name"]
+        for team in situation["formations"][0]["teams"] for member in team["members"]
+    }
+    assert visible_players == {player["name"] for player in players}

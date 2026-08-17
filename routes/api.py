@@ -279,13 +279,17 @@ def player_situation(player_id, event_id):
     get_place_item_or_404(Event, event_id, "Evento")
     registrations = Registration.query.filter_by(player_id=player_id, event_id=event_id).all()
     result = []
+    formations = {}
     for item in registrations:
         row = registration_dict(item)
         member = TeamMember.query.filter_by(registration_id=item.id).first()
         row["team"] = member.team.name if member else None
         row["assigned_position"] = member.position.name if member else None
         result.append(row)
-    return {"items": result}
+        payload = formation_payload(event_id, item.shift_id)
+        if payload["teams"]:
+            formations[payload["formation_shift_id"]] = payload
+    return {"items": result, "formations": list(formations.values())}
 
 
 @api_bp.get("/blacklist")

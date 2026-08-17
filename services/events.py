@@ -38,6 +38,12 @@ def registration_dict(registration, admin=False):
         "secondary_position": registration.secondary_position.name if registration.secondary_position else None,
         "assigned_position": registration.assigned_position.name if registration.assigned_position else None,
         "shift": registration.shift.name,
+        "selected_period": {
+            "id": registration.shift.id,
+            "name": registration.shift.name,
+            "starts_at": registration.shift.starts_at.isoformat(),
+            "ends_at": registration.shift.ends_at.isoformat(),
+        },
         "overall": registration.overall,
         "membership": "guest" if registration.is_guest else "member",
     })
