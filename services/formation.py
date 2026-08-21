@@ -201,11 +201,29 @@ class FormationService:
             raise ApiError("O time de destino deve pertencer ao mesmo evento e turno.", 422)
         if not position or not position.active or position.required_per_team <= 0:
             raise ApiError("Posição de destino inválida.", 422)
+        allowed_positions = {
+            member.registration.primary_position_id,
+            member.registration.secondary_position_id,
+        }
+        if position.id not in allowed_positions:
+            raise ApiError(
+                "O jogador só pode atuar na posição principal ou secundária cadastrada.", 422
+            )
         if source.id == target.id and source_position.id == position.id:
             return formation_payload(target.event_id, target.shift_id)
         occupants = TeamMember.query.filter_by(team_id=target.id, position_id=position.id).filter(TeamMember.id != member.id).all()
         if len(occupants) >= position.required_per_team:
-            swap = sorted(occupants, key=lambda item: (item.registration.overall, item.id))[0]
+            eligible_swaps = [item for item in occupants if source_position.id in {
+                item.registration.primary_position_id,
+                item.registration.secondary_position_id,
+            }]
+            if not eligible_swaps:
+                raise ApiError(
+                    f"{position.name} já atingiu o limite neste time. "
+                    "Altere primeiro a posição de outro jogador para liberar a vaga.",
+                    409,
+                )
+            swap = sorted(eligible_swaps, key=lambda item: (item.registration.overall, item.id))[0]
             swap.team = source
             swap.position = source_position
             swap.registration.assigned_position_id = source_position.id

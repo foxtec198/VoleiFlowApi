@@ -91,10 +91,19 @@ def test_manual_formation_position_change_swaps_players_inside_full_team(client,
             "primary_position_id": defensor["id"],
         })
         assert response.status_code == 200
-    registrations = [
-        register(client, event, shift, ponteiro if index < 2 else defensor, player)
-        for index, player in enumerate(players)
-    ]
+    registrations = []
+    for index, player in enumerate(players):
+        primary = ponteiro if index < 2 else defensor
+        secondary = defensor if index < 2 else ponteiro
+        response = client.post("/api/registrations", json={
+            "event_id": event["id"],
+            "shift_id": shift["id"],
+            "player_id": player["id"],
+            "primary_position_id": primary["id"],
+            "secondary_position_id": secondary["id"],
+        })
+        assert response.status_code == 201
+        registrations.append(response.get_json())
     with app.app_context():
         tokens = [db.session.get(Registration, item["id"]).email_confirmation_token for item in registrations]
     for token in tokens:
@@ -115,6 +124,16 @@ def test_manual_formation_position_change_swaps_players_inside_full_team(client,
     assert positions_by_member[occupant["id"]] == ponteiro["id"]
     assert list(positions_by_member.values()).count(defensor["id"]) == 1
     assert list(positions_by_member.values()).count(ponteiro["id"]) == 1
+
+    outra = client.post("/api/positions", json={
+        "name": "Outra posição", "required_per_team": 1,
+    }).get_json()
+    blocked = client.patch(f"/api/team-members/{source['id']}", json={
+        "team_id": team["id"],
+        "position_id": outra["id"],
+    })
+    assert blocked.status_code == 422
+    assert "principal ou secundária" in blocked.get_json()["error"]
 
 
 def test_confirmation_formation_and_balance(client, app):
