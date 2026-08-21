@@ -51,6 +51,39 @@ def test_crud_and_deduplicated_registration(client):
     assert toggled.get_json()["active"] is False
 
 
+def test_admin_can_override_registration_priority_and_position_with_capacity_guard(client, app):
+    ponteiro, shift, players, event = create_base(client, 3)
+    libero = client.post("/api/positions", json={
+        "name": "Defensor", "required_per_team": 1,
+    }).get_json()
+    first = register(client, event, shift, ponteiro, players[0])
+    register(client, event, shift, libero, players[1])
+    third = register(client, event, shift, ponteiro, players[2])
+
+    updated = client.patch(f"/api/registrations/{first['id']}", json={
+        "priority_level": 1,
+        "primary_position_id": libero["id"],
+    })
+    assert updated.status_code == 200
+    assert updated.get_json()["priority_level"] == 1
+    assert updated.get_json()["primary_position_id"] == libero["id"]
+    assert updated.get_json()["primary_position"] == "Defensor"
+
+    blocked = client.patch(f"/api/registrations/{third['id']}", json={
+        "priority_level": 3,
+        "primary_position_id": libero["id"],
+    })
+    assert blocked.status_code == 409
+    payload = blocked.get_json()
+    assert payload["details"]["requires_position_change"] is True
+    assert payload["details"]["position"] == "Defensor"
+    assert "Troque primeiro a posição" in payload["error"]
+    with app.app_context():
+        unchanged = db.session.get(Registration, third["id"])
+        assert unchanged.primary_position_id == ponteiro["id"]
+        assert unchanged.priority_level == third["priority_level"]
+
+
 def test_confirmation_formation_and_balance(client, app):
     position, shift, players, event = create_base(client, 2)
     registrations = [register(client, event, shift, position, player) for player in players]

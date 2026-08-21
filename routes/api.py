@@ -286,6 +286,14 @@ def registration_notes(item_id):
     return registration_dict(item, admin=True)
 
 
+@api_bp.patch("/registrations/<int:item_id>")
+@admin_required
+def update_registration(item_id):
+    result = RegistrationService.update_admin(get_registration_or_404(item_id), body())
+    socketio.emit("registration:changed", {"event_id": result["event_id"]})
+    return result
+
+
 @api_bp.get("/players/<int:player_id>/events/<int:event_id>/situation")
 def player_situation(player_id, event_id):
     get_player_or_404(player_id)
