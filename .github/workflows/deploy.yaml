@@ -23,7 +23,7 @@ jobs: # Jobs will run
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             set -e
-            cd /home/guibs/api_tmhub
+            cd /home/guibs/VoleiFlowApi
             sudo git pull origin main
             venv/bin/pip cache purge || true
             venv/bin/pip install --no-cache-dir -r requirements.txt --upgrade
