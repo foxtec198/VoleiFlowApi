@@ -103,11 +103,14 @@ class PlacePlayer(TimestampMixin, BaseModel):
     invited_by = db.Column(db.String(160))
     attendance_count = db.Column(db.Integer, nullable=False, default=0)
     absence_count = db.Column(db.Integer, nullable=False, default=0)
+    priority_override = db.Column(db.Integer)
 
     place = db.relationship("Place")
     player = db.relationship("Player")
 
     def priority_for(self, is_guest=None):
+        if self.priority_override in {1, 2, 3}:
+            return self.priority_override
         guest = self.is_guest if is_guest is None else bool(is_guest)
         level = 3 if guest else 2
         if (self.attendance_count or 0) >= 3:

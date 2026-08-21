@@ -1,6 +1,6 @@
 from sqlalchemy import func, or_
 
-from models import PlacePlayer, PlaceSetting, Player, Position, Shift
+from models import Event, PlacePlayer, PlaceSetting, Player, Position, Registration, Shift
 from services.common import as_bool, paginate, parse_date, parse_time, score
 from services.places import current_place
 from utils.db import db
@@ -26,6 +26,7 @@ def player_dict(player, private=True, membership=None, include_email=False):
             "attendance_count": membership.attendance_count,
             "absence_count": membership.absence_count,
             "priority_level": membership.priority_level,
+            "priority_override": membership.priority_override,
             "membership": "guest" if membership.is_guest else "member",
             "place_id": membership.place_id,
         })
@@ -112,6 +113,18 @@ class PlayerService:
         membership.active = as_bool(data.get("active", membership.active if membership.id else True))
         membership.is_guest = as_bool(data.get("is_guest", membership.is_guest or False))
         membership.invited_by = str(data.get("invited_by", "")).strip() or None
+        if "priority_override" in data:
+            raw_priority = data.get("priority_override")
+            if raw_priority in (None, ""):
+                membership.priority_override = None
+            else:
+                try:
+                    priority_override = int(raw_priority)
+                except (TypeError, ValueError):
+                    raise ApiError("A prioridade manual deve estar entre 1 e 3.", 422) from None
+                if priority_override not in {1, 2, 3}:
+                    raise ApiError("A prioridade manual deve estar entre 1 e 3.", 422)
+                membership.priority_override = priority_override
         player.active = True
         if data.get("birth_date"):
             player.birth_date = parse_date(data["birth_date"], "birth_date")
@@ -123,6 +136,16 @@ class PlayerService:
             setattr(player, field, score(data.get(field, 5), field))
         db.session.add(player)
         db.session.add(membership)
+        if "priority_override" in data and player.id:
+            db.session.flush()
+            active_registrations = Registration.query.join(Event).filter(
+                Registration.player_id == player.id,
+                Registration.status.in_(["confirmed", "pending_confirmation", "present", "waitlist"]),
+                Event.place_id == place.id,
+                Event.status == "scheduled",
+            ).all()
+            for registration in active_registrations:
+                registration.priority_level = membership.priority_level
         db.session.commit()
         return player_dict(player, membership=membership)
 

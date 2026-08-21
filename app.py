@@ -3,6 +3,7 @@ import os
 import click
 from dotenv import load_dotenv
 from flask import Flask, jsonify
+from sqlalchemy import inspect, text
 from flask_cors import CORS
 from flask.cli import with_appcontext
 from utils.bps import blueprints
@@ -40,6 +41,21 @@ def create_app(test_config=None):
     CORS(app, resources={r"/api/*": {"origins": "*"}})
     db.init_app(app)
     socketio.init_app(app, cors_allowed_origins="*", async_mode="gevent")
+
+    with app.app_context():
+        inspector = inspect(db.engine)
+        if "place_players" in inspector.get_table_names() and db.engine.dialect.name == "postgresql":
+            db.session.execute(text(
+                "ALTER TABLE place_players ADD COLUMN IF NOT EXISTS priority_override INTEGER"
+            ))
+            db.session.commit()
+        elif "place_players" in inspector.get_table_names():
+            columns = {column["name"] for column in inspector.get_columns("place_players")}
+            if "priority_override" not in columns:
+                db.session.execute(text(
+                    "ALTER TABLE place_players ADD COLUMN priority_override INTEGER"
+                ))
+                db.session.commit()
 
     for bp, prefix in blueprints.items():
         app.register_blueprint(bp, url_prefix=prefix)

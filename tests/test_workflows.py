@@ -51,37 +51,70 @@ def test_crud_and_deduplicated_registration(client):
     assert toggled.get_json()["active"] is False
 
 
-def test_admin_can_override_registration_priority_and_position_with_capacity_guard(client, app):
-    ponteiro, shift, players, event = create_base(client, 3)
-    libero = client.post("/api/positions", json={
-        "name": "Defensor", "required_per_team": 1,
-    }).get_json()
-    first = register(client, event, shift, ponteiro, players[0])
-    register(client, event, shift, libero, players[1])
-    third = register(client, event, shift, ponteiro, players[2])
+def test_admin_can_override_player_priority_and_restore_automatic_rule(client):
+    position, shift, players, event = create_base(client, 1)
+    player = players[0]
+    assert player["priority_level"] == 2
+    assert player["priority_override"] is None
+    registration = register(client, event, shift, position, player)
+    assert registration["priority_level"] == 2
 
-    updated = client.patch(f"/api/registrations/{first['id']}", json={
-        "priority_level": 1,
-        "primary_position_id": libero["id"],
+    updated = client.patch(f"/api/players/{player['id']}", json={
+        **player,
+        "priority_override": 1,
     })
     assert updated.status_code == 200
     assert updated.get_json()["priority_level"] == 1
-    assert updated.get_json()["primary_position_id"] == libero["id"]
-    assert updated.get_json()["primary_position"] == "Defensor"
+    assert updated.get_json()["priority_override"] == 1
+    event_detail = client.get(f"/api/events/{event['id']}").get_json()
+    assert event_detail["registrations"][0]["priority_level"] == 1
 
-    blocked = client.patch(f"/api/registrations/{third['id']}", json={
-        "priority_level": 3,
-        "primary_position_id": libero["id"],
+    automatic = client.patch(f"/api/players/{player['id']}", json={
+        **updated.get_json(),
+        "priority_override": None,
     })
-    assert blocked.status_code == 409
-    payload = blocked.get_json()
-    assert payload["details"]["requires_position_change"] is True
-    assert payload["details"]["position"] == "Defensor"
-    assert "Troque primeiro a posição" in payload["error"]
+    assert automatic.status_code == 200
+    assert automatic.get_json()["priority_level"] == 2
+    assert automatic.get_json()["priority_override"] is None
+    event_detail = client.get(f"/api/events/{event['id']}").get_json()
+    assert event_detail["registrations"][0]["priority_level"] == 2
+
+
+def test_manual_formation_position_change_swaps_players_inside_full_team(client, app):
+    ponteiro, shift, players, event = create_base(client, 4)
+    defensor = client.post("/api/positions", json={
+        "name": "Defensor", "required_per_team": 1,
+    }).get_json()
+    for player in players[2:]:
+        response = client.patch(f"/api/players/{player['id']}", json={
+            **player,
+            "primary_position_id": defensor["id"],
+        })
+        assert response.status_code == 200
+    registrations = [
+        register(client, event, shift, ponteiro if index < 2 else defensor, player)
+        for index, player in enumerate(players)
+    ]
     with app.app_context():
-        unchanged = db.session.get(Registration, third["id"])
-        assert unchanged.primary_position_id == ponteiro["id"]
-        assert unchanged.priority_level == third["priority_level"]
+        tokens = [db.session.get(Registration, item["id"]).email_confirmation_token for item in registrations]
+    for token in tokens:
+        assert client.get(f"/api/registrations/confirm/{token}").status_code == 200
+
+    formation = client.post(f"/api/events/{event['id']}/shifts/{shift['id']}/formation").get_json()
+    team = formation["teams"][0]
+    source = next(member for member in team["members"] if member["position_id"] == ponteiro["id"])
+    occupant = next(member for member in team["members"] if member["position_id"] == defensor["id"])
+    changed = client.patch(f"/api/team-members/{source['id']}", json={
+        "team_id": team["id"],
+        "position_id": defensor["id"],
+    })
+    assert changed.status_code == 200
+    changed_team = next(item for item in changed.get_json()["teams"] if item["id"] == team["id"])
+    positions_by_member = {item["id"]: item["position_id"] for item in changed_team["members"]}
+    assert positions_by_member[source["id"]] == defensor["id"]
+    assert positions_by_member[occupant["id"]] == ponteiro["id"]
+    assert list(positions_by_member.values()).count(defensor["id"]) == 1
+    assert list(positions_by_member.values()).count(ponteiro["id"]) == 1
 
 
 def test_confirmation_formation_and_balance(client, app):

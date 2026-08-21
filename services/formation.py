@@ -107,6 +107,9 @@ def formation_payload(event_id, shift_id):
         "formation_shift_id": formation_shift_id,
         "linked_shifts": [shift_period_dict(shift) for shift in group_shifts],
         "teams": [team_dict(team, periods_by_player=periods_by_player) for team in teams],
+        "positions": [position.to_dict() for position in Position.query.filter(
+            Position.active.is_(True), Position.required_per_team > 0
+        ).order_by(Position.name).all()],
         "differences": differences,
         "waitlist": waitlist,
     }
@@ -196,12 +199,12 @@ class FormationService:
         source_position = member.position
         if not target or target.event_id != member.team.event_id or target.shift_id != member.team.shift_id:
             raise ApiError("O time de destino deve pertencer ao mesmo evento e turno.", 422)
-        if not position or not position.active:
+        if not position or not position.active or position.required_per_team <= 0:
             raise ApiError("Posição de destino inválida.", 422)
+        if source.id == target.id and source_position.id == position.id:
+            return formation_payload(target.event_id, target.shift_id)
         occupants = TeamMember.query.filter_by(team_id=target.id, position_id=position.id).filter(TeamMember.id != member.id).all()
         if len(occupants) >= position.required_per_team:
-            if source.id == target.id:
-                raise ApiError("O jogador já ocupa essa vaga.", 409)
             swap = sorted(occupants, key=lambda item: (item.registration.overall, item.id))[0]
             swap.team = source
             swap.position = source_position

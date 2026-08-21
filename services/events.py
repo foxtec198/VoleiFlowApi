@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
-from models import BlacklistEntry, Event, PlacePlayer, Player, Position, Registration, Shift, TeamMember
+from models import BlacklistEntry, Event, PlacePlayer, Player, Position, Registration, Shift
 from services.catalog import get_settings
 from services.common import as_bool, paginate, parse_date, parse_datetime, parse_time, utcnow
 from services.mailer import send_confirmation
@@ -461,101 +461,6 @@ class RegistrationService:
             ))
         db.session.commit()
         return registration_dict(registration, admin=True)
-
-    @staticmethod
-    def update_admin(registration, data):
-        editable_fields = {"priority_level", "primary_position_id"}
-        if not editable_fields.intersection(data):
-            raise ApiError("Informe a prioridade ou a posição que deseja alterar.", 422)
-
-        priority_level = registration.priority_level
-        if "priority_level" in data:
-            try:
-                priority_level = int(data["priority_level"])
-            except (TypeError, ValueError):
-                raise ApiError("A prioridade deve ser um número entre 1 e 3.", 422) from None
-            if priority_level not in {1, 2, 3}:
-                raise ApiError("A prioridade deve estar entre 1 e 3.", 422)
-
-        old_position_id = registration.primary_position_id
-        target_position = registration.primary_position
-        team_member = TeamMember.query.filter_by(registration_id=registration.id).first()
-        if "primary_position_id" in data:
-            try:
-                position_id = int(data["primary_position_id"])
-            except (TypeError, ValueError):
-                raise ApiError("Posição inválida ou inativa.", 422) from None
-            target_position = db.session.get(Position, position_id)
-            if not target_position or not target_position.active:
-                raise ApiError("Posição inválida ou inativa.", 422)
-
-            if position_id != old_position_id and registration.status in {
-                "confirmed", "pending_confirmation", "present"
-            } and not position_has_capacity(
-                registration.event, registration.shift_id, position_id, registration.id
-            ):
-                occupants = Registration.query.filter(
-                    Registration.event_id == registration.event_id,
-                    Registration.shift_id == registration.shift_id,
-                    Registration.primary_position_id == position_id,
-                    Registration.id != registration.id,
-                    Registration.status.in_(["confirmed", "pending_confirmation", "present"]),
-                ).order_by(Registration.priority_level, Registration.snapshot_name).all()
-                capacity = target_position.required_per_team * registration.event.team_count
-                names = [item.snapshot_name for item in occupants]
-                raise ApiError(
-                    f"{target_position.name} já atingiu o limite de {capacity} vaga(s). "
-                    f"Troque primeiro a posição de {names[0] if names else 'outro jogador'} para liberar a vaga.",
-                    409,
-                    {
-                        "requires_position_change": True,
-                        "position_id": position_id,
-                        "position": target_position.name,
-                        "capacity": capacity,
-                        "occupants": [{"id": item.id, "name": item.snapshot_name} for item in occupants],
-                    },
-                )
-
-            if team_member and position_id != team_member.position_id:
-                team_occupants = TeamMember.query.filter(
-                    TeamMember.team_id == team_member.team_id,
-                    TeamMember.position_id == position_id,
-                    TeamMember.id != team_member.id,
-                ).order_by(TeamMember.id).all()
-                if len(team_occupants) >= target_position.required_per_team:
-                    names = [item.registration.snapshot_name for item in team_occupants]
-                    raise ApiError(
-                        f"{target_position.name} já está preenchida neste time. "
-                        f"Troque primeiro a posição de {names[0] if names else 'outro jogador'} para salvar.",
-                        409,
-                        {
-                            "requires_position_change": True,
-                            "position_id": position_id,
-                            "position": target_position.name,
-                            "occupants": [
-                                {"id": item.registration_id, "name": item.registration.snapshot_name}
-                                for item in team_occupants
-                            ],
-                        },
-                    )
-
-        registration.priority_level = priority_level
-        if target_position.id != old_position_id:
-            registration.primary_position = target_position
-            if team_member:
-                team_member.position = target_position
-                registration.assigned_position = target_position
-            elif registration.assigned_position_id:
-                registration.assigned_position_id = None
-            RegistrationService._rebalance_pending(
-                registration.event, registration.shift_id, old_position_id
-            )
-        RegistrationService._rebalance_pending(
-            registration.event, registration.shift_id, target_position.id
-        )
-        db.session.commit()
-        return registration_dict(registration, admin=True)
-
 
 class BlacklistService:
     @staticmethod
