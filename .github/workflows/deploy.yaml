@@ -1,0 +1,30 @@
+name: Deploy API - Volei Flow
+on: # Call event
+  push: # This is a PUSH event listener
+    branches: [ "main" ] 
+
+jobs: # Jobs will run
+  deploy: # This a deploy 
+    if: 
+      github.event_name == 'push' 
+
+    runs-on: 
+      ubuntu-latest # This is a RUN on Ubuntu (LINUX)
+
+    steps: # And this is steps for Deploy!
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: SSH Deploy
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd /home/guibs/api_tmhub
+            sudo git pull origin main
+            venv/bin/pip cache purge || true
+            venv/bin/pip install --no-cache-dir -r requirements.txt --upgrade
+            sudo systemctl restart voleiflow_api
