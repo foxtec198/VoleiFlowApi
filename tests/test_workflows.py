@@ -136,6 +136,53 @@ def test_manual_formation_position_change_swaps_players_inside_full_team(client,
     assert "principal ou secundária" in blocked.get_json()["error"]
 
 
+def test_admin_can_drag_waitlisted_player_into_team_and_send_occupant_to_bench(client, app):
+    ponteiro, shift, players, event = create_base(client, 5)
+    defensor = client.post("/api/positions", json={
+        "name": "Defensor", "required_per_team": 1,
+    }).get_json()
+    for player in players[2:4]:
+        response = client.patch(f"/api/players/{player['id']}", json={
+            **player,
+            "primary_position_id": defensor["id"],
+        })
+        assert response.status_code == 200
+    registrations = [
+        register(client, event, shift, defensor if 2 <= index < 4 else ponteiro, player)
+        for index, player in enumerate(players)
+    ]
+    with app.app_context():
+        tokens = [db.session.get(Registration, item["id"]).email_confirmation_token for item in registrations]
+    for token in tokens:
+        assert client.get(f"/api/registrations/confirm/{token}").status_code == 200
+
+    formation = client.post(f"/api/events/{event['id']}/shifts/{shift['id']}/formation").get_json()
+    bench = next(item for item in formation["waitlist"] if item["primary_position_id"] == ponteiro["id"])
+    assert bench["can_assign"] is True
+    target = formation["teams"][0]
+    occupant = next(item for item in target["members"] if item["position_id"] == ponteiro["id"])
+    added = client.post("/api/team-members", json={
+        "registration_id": bench["id"],
+        "team_id": target["id"],
+        "position_id": ponteiro["id"],
+        "replace_member_id": occupant["id"],
+    })
+    assert added.status_code == 200
+    payload = added.get_json()
+    changed_team = next(item for item in payload["teams"] if item["id"] == target["id"])
+    player_ids = {item["registration"]["player_id"] for item in changed_team["members"]}
+    assert bench["player_id"] in player_ids
+    assert occupant["registration"]["player_id"] not in player_ids
+    waiting_ids = {item["player_id"] for item in payload["waitlist"]}
+    assert occupant["registration"]["player_id"] in waiting_ids
+    assert bench["player_id"] not in waiting_ids
+    replacement = next(item for item in payload["waitlist"] if item["player_id"] == occupant["registration"]["player_id"])
+    assert replacement["status"] == "waitlist"
+    promoted = next(item for item in changed_team["members"] if item["registration"]["player_id"] == bench["player_id"])
+    assert promoted["registration"]["status"] == "confirmed"
+    assert sum(item["position_id"] == ponteiro["id"] for item in changed_team["members"]) == 1
+
+
 def test_confirmation_formation_and_balance(client, app):
     position, shift, players, event = create_base(client, 2)
     registrations = [register(client, event, shift, position, player) for player in players]

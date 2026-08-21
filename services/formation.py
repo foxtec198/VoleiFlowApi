@@ -1,7 +1,7 @@
 from collections import defaultdict
 
 from models import Event, Position, Registration, Team, TeamMember
-from services.events import registration_dict
+from services.events import active_blacklist, registration_dict
 from services.places import current_place
 from utils.db import db
 from utils.errors import ApiError
@@ -100,6 +100,12 @@ def formation_payload(event_id, shift_id):
         waiting_players.add(registration.player_id)
         row = registration_dict(registration)
         row["selected_periods"] = periods_by_player[registration.player_id]
+        row["can_assign"] = registration.status in {
+            "confirmed", "pending_confirmation", "present"
+        } or (
+            registration.status == "waitlist"
+            and not active_blacklist(registration.player_id, event.place_id)
+        )
         waitlist.append(row)
     return {
         "event_id": event_id,
@@ -230,6 +236,81 @@ class FormationService:
         member.team = target
         member.position = position
         member.registration.assigned_position_id = position.id
+        db.session.flush()
+        for team in Team.query.filter_by(event_id=target.event_id, shift_id=target.shift_id):
+            team.balance_score = team_metrics(team)["overall"]
+        db.session.commit()
+        return formation_payload(target.event_id, target.shift_id)
+
+    @staticmethod
+    def add_from_waitlist(registration, target_team_id, position_id, replace_member_id=None):
+        target = db.session.get(Team, target_team_id)
+        position = db.session.get(Position, position_id)
+        if not target or target.event_id != registration.event_id:
+            raise ApiError("O time de destino deve pertencer ao mesmo evento.", 422)
+        event = db.session.get(Event, target.event_id)
+        if not event or event.place_id != current_place().id:
+            raise ApiError("Time de destino não encontrado.", 404)
+        group_ids = [shift.id for shift in linked_shifts(event, target.shift_id)]
+        if registration.shift_id not in group_ids:
+            raise ApiError("O jogador não pertence aos turnos interligados deste time.", 422)
+        if registration.status not in {"confirmed", "pending_confirmation", "present", "waitlist"}:
+            raise ApiError("Somente jogadores disponíveis podem sair do banco para um time.", 409)
+        if active_blacklist(registration.player_id, event.place_id):
+            raise ApiError("Jogador bloqueado não pode ser escalado manualmente.", 409)
+        if not position or not position.active or position.required_per_team <= 0:
+            raise ApiError("Posição de destino inválida.", 422)
+        if position.id not in {
+            registration.primary_position_id,
+            registration.secondary_position_id,
+        }:
+            raise ApiError(
+                "O jogador só pode atuar na posição principal ou secundária cadastrada.", 422
+            )
+        already_assigned = TeamMember.query.join(
+            Team, TeamMember.team_id == Team.id
+        ).join(
+            Registration, TeamMember.registration_id == Registration.id
+        ).filter(
+            Team.event_id == target.event_id,
+            Team.shift_id == target.shift_id,
+            Registration.player_id == registration.player_id,
+        ).first()
+        if already_assigned:
+            raise ApiError("Este jogador já está escalado nesta formação.", 409)
+
+        occupants = TeamMember.query.filter_by(
+            team_id=target.id, position_id=position.id
+        ).order_by(TeamMember.id).all()
+        if len(occupants) >= position.required_per_team:
+            replacement = db.session.get(TeamMember, replace_member_id) if replace_member_id else None
+            if not replacement or replacement not in occupants:
+                raise ApiError(
+                    f"{position.name} já atingiu o limite neste time. "
+                    "Confirme qual jogador deve ir para o banco.",
+                    409,
+                    {"occupants": [
+                        {"id": item.id, "name": item.registration.snapshot_name}
+                        for item in occupants
+                    ]},
+                )
+            replacement.registration.assigned_position_id = None
+            if registration.status == "waitlist":
+                registration.status = (
+                    "confirmed"
+                    if replacement.registration.status in {"confirmed", "present"}
+                    else "pending_confirmation"
+                )
+                replacement.registration.status = "waitlist"
+            db.session.delete(replacement)
+
+        elif registration.status == "waitlist":
+            registration.status = "pending_confirmation"
+
+        registration.assigned_position_id = position.id
+        db.session.add(TeamMember(
+            team=target, registration=registration, position=position
+        ))
         db.session.flush()
         for team in Team.query.filter_by(event_id=target.event_id, shift_id=target.shift_id):
             team.balance_score = team_metrics(team)["overall"]

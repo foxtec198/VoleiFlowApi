@@ -349,6 +349,25 @@ def move_team_member(item_id):
     return result
 
 
+@api_bp.post("/team-members")
+@admin_required
+def add_team_member():
+    data = body()
+    require_fields(data, "registration_id", "team_id", "position_id")
+    registration = get_registration_or_404(data["registration_id"])
+    result = FormationService.add_from_waitlist(
+        registration,
+        data["team_id"],
+        data["position_id"],
+        data.get("replace_member_id"),
+    )
+    socketio.emit("formation:changed", {
+        "event_id": registration.event_id,
+        "shift_id": result["formation_shift_id"],
+    })
+    return result
+
+
 @api_bp.get("/events/<int:event_id>/shifts/<int:shift_id>/whatsapp")
 @admin_required
 def whatsapp_text(event_id, shift_id):
